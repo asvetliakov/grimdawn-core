@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { loadGameDb, loadNormalizedDb } from '../src/db/index.js';
-import { listMods, modArchive, modArchivePath, modsDefiningRecords } from '../src/db/mods.js';
+import { listMods, modArchive, modArchivePath, modsDefiningRecords, resolveModArchive } from '../src/db/mods.js';
 import { findGameDir } from '../src/db/gamefiles.js';
 import { parseGdc } from '../src/save/gdc.js';
 import { characterMasteries } from '../src/save/mastery.js';
@@ -39,9 +39,22 @@ const SUBJECT = modCharacter();
 describe.skipIf(!GAME_DIR)('installed mods', () => {
   it('lists only the directories that actually ship a database', () => {
     for (const mod of MODS) {
-      expect(mod.archivePath).toBe(modArchivePath(GAME_DIR!, mod.name));
+      // The convention up to case: this install has
+      // `mods/survivalmode/database/SurvivalMode.arz`, which composing the path
+      // finds on macOS and Windows and would miss on a Linux prefix. What is
+      // asserted is the file, not the spelling.
+      expect(mod.archivePath.toLowerCase()).toBe(modArchivePath(GAME_DIR!, mod.name).toLowerCase());
       expect(() => readFileSync(mod.archivePath)).not.toThrow();
     }
+  });
+
+  it('finds a mod however the name is cased, and reports it as the disk spells it', () => {
+    if (!MODS.length) return;
+    const asked = MODS[0]!.name.toUpperCase();
+    const found = resolveModArchive(GAME_DIR!, asked);
+    expect(found?.name).toBe(MODS[0]!.name);
+    expect(found?.archivePath).toBe(MODS[0]!.archivePath);
+    expect(resolveModArchive(GAME_DIR!, 'not-a-mod-on-this-machine')).toBeUndefined();
   });
 
   it('says so, and what it does have, when asked for a mod that is not installed', () => {

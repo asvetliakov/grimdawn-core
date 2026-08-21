@@ -29,22 +29,52 @@ export interface InstalledMod {
   archivePath: string;
 }
 
-/** Where a mod's database lives, by the convention the game itself follows. */
+/**
+ * Where a mod's database lives, by the convention the game itself follows.
+ *
+ * This composes the path; it does not claim the file is there, and on a
+ * case-sensitive filesystem it may not even be spelled that way — see
+ * `resolveModArchive`. Use it to write one, or to say in an error message where
+ * one was looked for.
+ */
 export function modArchivePath(gameDir: string, name: string): string {
   return join(gameDir, 'mods', name, 'database', `${name}.arz`);
+}
+
+/**
+ * The archive a mod actually ships, found by matching rather than by composing.
+ *
+ * The convention is `mods/<name>/database/<name>.arz`, and it is a convention
+ * about the *game's* lookup, not about what an author typed: this install has
+ * `mods/survivalmode/database/SurvivalMode.arz`. On macOS and Windows that
+ * composes and opens anyway, which is exactly why it has to be matched here —
+ * the same mod on a Linux install (Proton, a case-sensitive prefix) would
+ * simply not be found, and "no mod database" is the wrong answer to give
+ * someone whose mod is right there. The directory is matched the same way, and
+ * the name is reported back as the disk spells it.
+ */
+export function resolveModArchive(gameDir: string, name: string): InstalledMod | undefined {
+  const modsDir = join(gameDir, 'mods');
+  const wantedDir = name.toLowerCase();
+  const dir = safeReaddir(modsDir).find((d) => d.toLowerCase() === wantedDir);
+  if (dir === undefined) return undefined;
+
+  const databaseDir = join(modsDir, dir, 'database');
+  const wantedFile = `${dir.toLowerCase()}.arz`;
+  const file = safeReaddir(databaseDir).find((f) => f.toLowerCase() === wantedFile);
+  if (file === undefined) return undefined;
+
+  return { name: dir, archivePath: join(databaseDir, file) };
 }
 
 /** Every mod in this install that ships a database, in directory order. */
 export function listMods(gameDir: string): InstalledMod[] {
   const out: InstalledMod[] = [];
   for (const name of safeReaddir(join(gameDir, 'mods'))) {
-    const archivePath = modArchivePath(gameDir, name);
-    try {
-      statSync(archivePath);
-    } catch {
-      continue; // a loose file, or a mod shipping only resources
-    }
-    out.push({ name, archivePath });
+    // A loose file in `mods/` (`database.arz`, `scripts.arc`) resolves to
+    // nothing, which is the test — a mod is a directory with a database.
+    const found = resolveModArchive(gameDir, name);
+    if (found) out.push(found);
   }
   return out;
 }
@@ -58,18 +88,16 @@ export function listMods(gameDir: string): InstalledMod[] {
  * never read.
  */
 export function modArchive(gameDir: string, name: string): GameArchive {
-  const path = modArchivePath(gameDir, name);
-  let st;
-  try {
-    st = statSync(path);
-  } catch {
+  const found = resolveModArchive(gameDir, name);
+  if (!found) {
     const installed = listMods(gameDir).map((m) => m.name);
     throw new Error(
-      `no mod database at ${path}` +
+      `no mod database at ${modArchivePath(gameDir, name)}` +
         (installed.length ? ` — this install has: ${installed.join(', ')}` : ' — this install has no mods'),
     );
   }
-  return { expansion: name, path, size: st.size, mtimeMs: st.mtimeMs };
+  const st = statSync(found.archivePath);
+  return { expansion: found.name, path: found.archivePath, size: st.size, mtimeMs: st.mtimeMs };
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * Writing an `.arz`.
+ * Writing an `.arz` — a whole one, and into one somebody else made.
  *
  * The gate is the same one the save writer has: an encoder that has drifted
  * from its decoder must fail rather than produce a plausible wrong file. Here
@@ -9,16 +9,34 @@
  * tests prove it would catch one, and that the values it means to change are
  * the only ones that move.
  *
- * Everything is gated on the game being installed. Nothing is committed: the
- * archives are the user's, and the mod is generated from them.
+ * The stakes went up when the target became somebody's installed mod rather
+ * than a mod of our own, so the editing tests are stricter than "our records
+ * came back": they require *every other record in the archive* to be identical
+ * afterwards, and the bytes of the untouched blocks to be in the same place.
+ *
+ * Everything is gated on the game being installed. **Nothing writes to the
+ * install**: the one test that needs a file to edit builds its own game
+ * directory out of symlinks to the real archives and a `mods/` of its own.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { readArz, readArzRaw, writeArz, compressLz4Literals, decompressLz4Block } from '../src/db/arz.js';
+import {
+  appendArzRecords,
+  compressLz4Literals,
+  decompressLz4Block,
+  patchArzValues,
+  readArz,
+  readArzRaw,
+  writeArz,
+  type RawArzRecord,
+} from '../src/db/arz.js';
 import { findGameDir, gameArchives } from '../src/db/gamefiles.js';
-import { planSpeedMod, SPEED_MOD_RECORDS } from '../src/db/speedmod.js';
+import { listMods } from '../src/db/mods.js';
+import { BASE_MOD_ARCHIVE, planSpeedMod, SPEED_MOD_RECORDS, type SpeedModBaseline } from '../src/db/speedmod.js';
 import { MISSING_GAME_MESSAGE, haveGameInstall } from './paths.js';
 
 describe('LZ4 literal-only blocks', () => {
@@ -41,12 +59,25 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
   const wanted = (r: string) => SPEED_MOD_RECORDS.includes(r);
 
   /** The three records as the game's own archives merge them, last wins. */
-  function liveRecords() {
-    const winners = new Map<string, ReturnType<typeof readArzRaw> extends Map<string, infer R> ? R : never>();
+  function liveRecords(): Map<string, RawArzRecord> {
+    const winners = new Map<string, RawArzRecord>();
     for (const archive of gameArchives(gameDir)) {
       for (const [key, rec] of readArzRaw(readFileSync(archive.path), { filter: wanted })) winners.set(key, rec);
     }
     return winners;
+  }
+
+  /** Some record that has nothing to do with movement speed — the bystander. */
+  function bystander(): RawArzRecord {
+    const buf = readFileSync(gameArchives(gameDir)[0]!.path);
+    let picked: string | undefined;
+    const found = readArzRaw(buf, {
+      filter: (r) => {
+        if (picked === undefined && !SPEED_MOD_RECORDS.includes(r)) picked = r;
+        return r === picked;
+      },
+    });
+    return found.get(picked!)!;
   }
 
   it('reads raw records that agree with the ordinary reader', () => {
@@ -93,74 +124,50 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
     expect(cooked.size).toBe(SPEED_MOD_RECORDS.length);
   });
 
-  it('plans the two speed changes, from whichever archive won each record', () => {
-    const plan = planSpeedMod({ gameDir, runPercent: 35 });
+  it('patches one value in an existing archive and leaves every other record alone', () => {
+    const archive = writeArz([...liveRecords().values(), bystander()]);
+    const before = readArz(archive);
 
-    expect(plan.refusals).toEqual([]);
-    expect(plan.output).toBeDefined();
-    expect(plan.arzPath).toBe(`${gameDir}/mods/gdspeed/database/gdspeed.arz`);
-    expect(plan.launchHint).toBe('/basemods:gdspeed');
+    const patched = patchArzValues(archive, [
+      { record: 'records/game/gameengine.dbr', field: 'playerRunSpeedCapMax', value: 675 },
+    ]);
+    const after = readArz(patched);
 
-    // One change per record: run speed on both player creatures, the cap on the
-    // engine record.
-    expect(plan.changes.map((c) => c.record).sort()).toEqual([...SPEED_MOD_RECORDS].sort());
-    expect(plan.changes.filter((c) => c.field === 'characterRunSpeed')).toHaveLength(2);
-    expect(plan.changes.filter((c) => c.field === 'playerRunSpeedCapMax')).toHaveLength(1);
-
-    for (const change of plan.changes) {
-      expect(change.to, `${change.record}.${change.field}`).toBeCloseTo(change.from * 1.35, 4);
-      expect(change.to).toBeGreaterThan(change.from);
-    }
-
-    // The records are not all in the same archive, which is why the merge is
-    // per record rather than "read the newest expansion".
-    const engine = plan.changes.find((c) => c.field === 'playerRunSpeedCapMax')!;
-    expect(engine.sourceArchive).toBeTruthy();
-  });
-
-  it('changes those two fields and nothing else in the records it ships', () => {
-    const plan = planSpeedMod({ gameDir, runPercent: 50, capPercent: 20 });
-    expect(plan.refusals).toEqual([]);
-
-    const before = liveRecords();
-    const after = readArzRaw(plan.output!, { filter: wanted });
-
+    expect(after.size).toBe(before.size);
     for (const [key, was] of before) {
-      const now = after.get(key)!;
-      const changedField = plan.changes.find((c) => c.record === key)!.field;
-      for (const [i, field] of was.fields.entries()) {
-        const current = now.fields[i]!;
-        if (field.key === changedField) {
-          expect(current.values[0], key).not.toBe(field.values[0]);
-          expect(current.type, key).toBe(field.type);
-        } else {
-          expect(current, `${key}.${field.key}`).toEqual(field);
-        }
-      }
+      if (key === 'records/game/gameengine.dbr') continue;
+      expect(after.get(key), key).toEqual(was);
     }
+    expect(after.get('records/game/gameengine.dbr')!.fields['playerRunSpeedCapMax']).toBe(675);
 
-    // The two knobs are independent.
-    const run = plan.changes.find((c) => c.field === 'characterRunSpeed')!;
-    const cap = plan.changes.find((c) => c.field === 'playerRunSpeedCapMax')!;
-    expect(run.to).toBeCloseTo(run.from * 1.5, 4);
-    expect(cap.to).toBeCloseTo(cap.from * 1.2, 4);
+    // Appended, not rewritten: the file grows by one block and no more.
+    expect(patched.length).toBeGreaterThan(archive.length);
+    expect(patched.length - archive.length).toBeLessThan(archive.length);
   });
 
-  it('sources from an installed mod when asked, rather than from the base game', () => {
-    const mod = 'pathofgrimdawn';
-    if (!existsSync(`${gameDir}/mods/${mod}/database/${mod}.arz`)) return;
+  it('refuses a patch it cannot make rather than making a different one', () => {
+    const archive = writeArz([...liveRecords().values()]);
+    expect(() => patchArzValues(archive, [{ record: 'records/nope.dbr', field: 'x', value: 1 }])).toThrow(
+      /not in this archive/,
+    );
+    expect(() =>
+      patchArzValues(archive, [{ record: 'records/game/gameengine.dbr', field: 'notAField', value: 1 }]),
+    ).toThrow(/has no notafield field/i);
+  });
 
-    const base = planSpeedMod({ gameDir, runPercent: 35 });
-    const over = planSpeedMod({ gameDir, runPercent: 35, overMod: mod });
-    expect(over.refusals).toEqual([]);
+  it('appends records an archive does not have, and keeps the ones it does', () => {
+    const other = bystander();
+    const archive = writeArz([other]);
+    const additions = [...liveRecords().values()];
 
-    // This mod raises the movement cap itself (to 500 on this install), so a mod
-    // built from the base game's 135 would hand its players a *lower* ceiling
-    // than the one they are already playing with.
-    const baseCap = base.changes.find((c) => c.field === 'playerRunSpeedCapMax')!;
-    const overCap = over.changes.find((c) => c.field === 'playerRunSpeedCapMax')!;
-    expect(overCap.from).toBeGreaterThan(baseCap.from);
-    expect(overCap.sourceArchive).toBe(mod);
+    const grown = appendArzRecords(archive, additions);
+    const after = readArzRaw(grown, { filter: () => true });
+
+    expect(after.size).toBe(1 + additions.length);
+    expect(after.get(other.record)).toEqual(other);
+    for (const rec of additions) expect(after.get(rec.record), rec.record).toEqual(rec);
+
+    expect(() => appendArzRecords(grown, [additions[0]!])).toThrow(/already named/);
   });
 
   it('refuses rather than writing when the archive it built disagrees with the reader', () => {
@@ -172,5 +179,191 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
     const corrupt = Buffer.from(archive);
     corrupt.writeUInt32LE(source.length + 5, 12);
     expect(() => readArzRaw(corrupt, { filter: wanted })).toThrow();
+  });
+});
+
+describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGameInstall() ? 'live install' : MISSING_GAME_MESSAGE})`, () => {
+  if (!haveGameInstall()) it.skip(MISSING_GAME_MESSAGE, () => {});
+
+  const realGameDir = findGameDir()!;
+  let dir: string;
+  let basePath: string;
+  let bystanderRecord: RawArzRecord;
+
+  /**
+   * A game directory that is the real one for reading and ours for writing:
+   * the four archives are symlinked, `mods/` is a directory of our own. The
+   * install is never written to, and the edit is exercised for real.
+   */
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'gd-speed-'));
+    for (const part of ['database', 'gdx1', 'gdx2', 'gdx3']) {
+      const from = join(realGameDir, part);
+      if (existsSync(from)) symlinkSync(from, join(dir, part));
+    }
+    mkdirSync(join(dir, 'mods'));
+    basePath = join(dir, 'mods', BASE_MOD_ARCHIVE);
+
+    const buf = readFileSync(gameArchives(realGameDir)[0]!.path);
+    let picked: string | undefined;
+    bystanderRecord = readArzRaw(buf, {
+      filter: (r) => {
+        if (picked === undefined && !SPEED_MOD_RECORDS.includes(r)) picked = r;
+        return r === picked;
+      },
+    }).get(picked!)!;
+  });
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('creates the base mod when there is none, naming the archive /basemods loads', () => {
+    const plan = planSpeedMod({ gameDir: dir, runPercent: 35 });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.action).toBe('create');
+    expect(plan.arzPath).toBe(basePath);
+    expect(plan.launchHint).toBe('/basemods');
+    expect(plan.changes.map((c) => c.how)).toEqual(['add', 'add', 'add']);
+    for (const change of plan.changes) expect(change.to).toBeCloseTo(change.from * 1.35, 4);
+  });
+
+  it('merges into one that already exists, keeping every record already in it', () => {
+    // Somebody else's base mod: one unrelated record and none of ours.
+    writeFileSync(basePath, writeArz([bystanderRecord]));
+
+    const plan = planSpeedMod({ gameDir: dir, runPercent: 35 });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.action).toBe('patch');
+    expect(plan.changes.map((c) => c.how)).toEqual(['add', 'add', 'add']);
+
+    const after = readArzRaw(plan.output!, { filter: () => true });
+    expect(after.size).toBe(1 + SPEED_MOD_RECORDS.length);
+    expect(after.get(bystanderRecord.record)).toEqual(bystanderRecord);
+  });
+
+  it('overwrites its own records the second time, and does not compound the percentage', () => {
+    const first = planSpeedMod({ gameDir: dir, runPercent: 35 });
+    writeFileSync(basePath, first.output!);
+    const baseline = first.baseline!;
+    const originals = new Map(baseline.map((b) => [`${b.record} ${b.field}`, b.original]));
+
+    // Same percentage, same baseline: there is nothing left to do.
+    const again = planSpeedMod({ gameDir: dir, runPercent: 35, baseline });
+    expect(again.output).toBeUndefined();
+    expect(again.refusals).toEqual([{ kind: 'nothing-to-change' }]);
+    expect(again.untouched).toHaveLength(3);
+    expect(again.drifted).toBe(false);
+
+    // A different percentage measures from the original, not from what is there.
+    const more = planSpeedMod({ gameDir: dir, runPercent: 50, baseline });
+    expect(more.refusals).toEqual([]);
+    expect(more.changes.map((c) => c.how)).toEqual(['overwrite', 'overwrite', 'overwrite']);
+    for (const change of more.changes) {
+      const original = originals.get(`${change.record} ${change.field}`)!;
+      expect(change.original, change.record).toBe(original);
+      expect(change.to, change.record).toBeCloseTo(original * 1.5, 4);
+      // …which is emphatically not 1.35 × 1.5.
+      expect(change.to).toBeLessThan(original * 1.35 * 1.5);
+    }
+  });
+
+  it('puts a field back where it started at 0%', () => {
+    const first = planSpeedMod({ gameDir: dir, runPercent: 40 });
+    writeFileSync(basePath, first.output!);
+
+    const back = planSpeedMod({ gameDir: dir, runPercent: 0, capPercent: 40, baseline: first.baseline! });
+    expect(back.refusals).toEqual([]);
+    const run = back.changes.filter((c) => c.field === 'characterRunSpeed');
+    expect(run).toHaveLength(2);
+    for (const change of run) expect(change.to).toBe(change.original);
+    // The cap is already at +40%, so nothing to do there.
+    expect(back.untouched.map((u) => u.field)).toEqual(['playerRunSpeedCapMax']);
+  });
+
+  it('says so when the archive no longer holds what it wrote', () => {
+    const first = planSpeedMod({ gameDir: dir, runPercent: 25 });
+    writeFileSync(basePath, first.output!);
+
+    // The mod's author ships an update — or anything else edits the file.
+    const meddled: SpeedModBaseline[] = first.baseline!.map((b) => ({ ...b, written: b.written + 7 }));
+    const plan = planSpeedMod({ gameDir: dir, runPercent: 25, baseline: meddled });
+    expect(plan.drifted).toBe(true);
+    // What is there now is the new original, rather than being quietly re-based.
+    for (const change of plan.changes) expect(change.original).toBe(change.from);
+  });
+
+  it('refuses a percentage that would stop the character, and one that changes nothing', () => {
+    for (const percent of [-100, -150, Number.NaN]) {
+      const plan = planSpeedMod({ gameDir: dir, runPercent: percent });
+      expect(plan.output, String(percent)).toBeUndefined();
+      expect(plan.refusals.map((r) => r.kind)).toContain('percent-out-of-range');
+    }
+
+    rmSync(basePath, { force: true });
+    const nothing = planSpeedMod({ gameDir: dir, runPercent: 0, capPercent: 0 });
+    expect(nothing.output).toBeUndefined();
+    expect(nothing.refusals).toEqual([{ kind: 'nothing-to-change' }]);
+    expect(nothing.untouched).toHaveLength(3);
+  });
+
+  it('refuses a mod that is not installed, and says what is', () => {
+    const plan = planSpeedMod({ gameDir: dir, target: { kind: 'mod', mod: 'not-a-mod-on-this-machine' } });
+    expect(plan.output).toBeUndefined();
+    expect(plan.refusals.map((r) => r.kind)).toEqual(['target-mod-missing']);
+  });
+});
+
+describe.skipIf(!haveGameInstall())(`the speed change, into an installed mod (${haveGameInstall() ? 'live install' : MISSING_GAME_MESSAGE})`, () => {
+  if (!haveGameInstall()) it.skip(MISSING_GAME_MESSAGE, () => {});
+
+  const gameDir = findGameDir()!;
+  const mods = listMods(gameDir);
+
+  it('plans against that mod’s own numbers, and writes nothing anywhere', () => {
+    const mod = mods[0];
+    if (!mod) return;
+
+    const source = readFileSync(mod.archivePath);
+    const plan = planSpeedMod({ gameDir, target: { kind: 'mod', mod: mod.name }, runPercent: 35 });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.action).toBe('patch');
+    expect(plan.arzPath).toBe(mod.archivePath);
+    // A Custom Game mod is chosen in the menu; there is nothing to add to the
+    // launch options for one.
+    expect(plan.launchHint).toBeUndefined();
+
+    // Whatever this mod sets these to is what the percentage is measured from.
+    for (const change of plan.changes) {
+      expect(change.to, change.record).toBeCloseTo(change.from * 1.35, 4);
+      if (change.how === 'overwrite') expect(change.sourceArchive).toBe(mod.name);
+    }
+
+    // The archive on disk is exactly as it was: this is a plan, not a write.
+    expect(readFileSync(mod.archivePath).equals(source)).toBe(true);
+    // And what it would write is that archive with the ends moved, not a new one.
+    expect(plan.output!.length).toBeGreaterThan(source.length);
+    expect(plan.output!.subarray(24, source.readUInt32LE(4)).equals(source.subarray(24, source.readUInt32LE(4)))).toBe(
+      true,
+    );
+  });
+
+  it('leaves every other record in that mod exactly as it was', () => {
+    const mod = mods.find((m) => readFileSync(m.archivePath).length < 40_000_000) ?? mods[0];
+    if (!mod) return;
+
+    const source = readFileSync(mod.archivePath);
+    const plan = planSpeedMod({ gameDir, target: { kind: 'mod', mod: mod.name }, runPercent: 35 });
+    if (plan.refusals.length) return;
+
+    const before = readArz(source);
+    const after = readArz(plan.output!);
+    expect(after.size).toBe(before.size + plan.changes.filter((c) => c.how === 'add').length);
+
+    const touched = new Set(plan.changes.map((c) => c.record));
+    let differing = 0;
+    for (const [key, was] of before) {
+      if (touched.has(key)) continue;
+      if (JSON.stringify(after.get(key)) !== JSON.stringify(was)) differing++;
+    }
+    expect(differing).toBe(0);
   });
 });

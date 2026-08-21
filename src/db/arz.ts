@@ -391,6 +391,285 @@ export function compressLz4Literals(data: Buffer): Buffer {
   return Buffer.concat([Buffer.from(head), data]);
 }
 
+/** A record's field stream, as the file stores it. The inverse of `readRawFields`. */
+function encodeRawFields(rec: RawArzRecord, intern: (s: string) => number): Buffer {
+  const parts: Buffer[] = [];
+  for (const field of rec.fields) {
+    const head = Buffer.alloc(8);
+    head.writeUInt16LE(field.type, 0);
+    head.writeUInt16LE(field.values.length, 2);
+    head.writeUInt32LE(intern(field.key), 4);
+    parts.push(head);
+
+    const body = Buffer.alloc(field.values.length * 4);
+    field.values.forEach((value, i) => {
+      if (field.type === FieldType.Float) {
+        body.writeFloatLE(value as number, i * 4);
+      } else if (field.type === FieldType.String) {
+        body.writeUInt32LE(intern(value as string), i * 4);
+      } else {
+        body.writeInt32LE(value as number, i * 4);
+      }
+    });
+    parts.push(body);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Add records an archive does not have, leaving what it does have untouched.
+ *
+ * The companion to `patchArzValues`, for the same job from the other side: a
+ * mod's archive may simply not mention a record an edit needs — someone else's
+ * base mod adds a few items and never touches `gameengine.dbr` — and the edit
+ * has to go somewhere.
+ *
+ * Every existing index stays valid, which is what makes this safe: the string
+ * table is only ever *appended* to, so no record anywhere needs rewriting to
+ * follow a string that moved. Data blocks and record-table entries append the
+ * same way, and the counts and offsets in the header are the only numbers that
+ * change.
+ *
+ * Adding a record the archive already has would leave two entries with the same
+ * name and the reader would keep the last; that is the caller's mistake to
+ * avoid, so it throws.
+ */
+export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]): Buffer {
+  if (buf.length < 24) throw new Error(`not an .arz archive: ${buf.length} bytes is shorter than the header`);
+  if (buf.readUInt16LE(0) !== ARZ_MAGIC) throw new Error(`not an .arz archive: magic ${buf.readUInt16LE(0)}`);
+  if (buf.readUInt16LE(2) !== ARZ_VERSION) throw new Error(`unsupported .arz version ${buf.readUInt16LE(2)}`);
+  if (!records.length) return Buffer.from(buf);
+
+  const recordTableStart = buf.readUInt32LE(4);
+  const recordTableSize = buf.readUInt32LE(8);
+  const recordCount = buf.readUInt32LE(12);
+  const stringTableStart = buf.readUInt32LE(16);
+  const stringTableSize = buf.readUInt32LE(20);
+
+  const strings = readStringTable(buf, stringTableStart);
+  const index = new Map<string, number>();
+  strings.forEach((s, i) => {
+    if (!index.has(s)) index.set(s, i);
+  });
+
+  const have = new Set(strings.map((s) => s.toLowerCase()));
+  const added: string[] = [];
+  const intern = (s: string): number => {
+    const seen = index.get(s);
+    if (seen !== undefined) return seen;
+    const at = strings.length + added.length;
+    index.set(s, at);
+    added.push(s);
+    return at;
+  };
+
+  const blocks: Buffer[] = [];
+  const entries: Buffer[] = [];
+  let appendedSize = 0;
+  const dataSize = recordTableStart - 24;
+
+  for (const rec of records) {
+    if (have.has(rec.record.toLowerCase())) {
+      // A name in the table is not proof it is a record — but it is proof this
+      // is not the clean append this function promises.
+      throw new Error(`${rec.record} is already named in this archive`);
+    }
+    const nameIndex = intern(rec.record);
+    const raw = encodeRawFields(rec, intern);
+    const block = compressLz4Literals(raw);
+
+    const typeBytes = Buffer.from(rec.type, 'latin1');
+    const entry = Buffer.alloc(4 + 4 + typeBytes.length + 4 + 4 + 4 + 8);
+    let o = 0;
+    entry.writeUInt32LE(nameIndex, o); o += 4;
+    entry.writeUInt32LE(typeBytes.length, o); o += 4;
+    typeBytes.copy(entry, o); o += typeBytes.length;
+    entry.writeUInt32LE(dataSize + appendedSize, o); o += 4;
+    entry.writeUInt32LE(block.length, o); o += 4;
+    entry.writeUInt32LE(raw.length, o); o += 4;
+    entry.writeBigUInt64LE(rec.fileTime, o);
+
+    blocks.push(block);
+    entries.push(entry);
+    appendedSize += block.length;
+  }
+
+  const newStrings: Buffer[] = [];
+  for (const s of added) {
+    const bytes = Buffer.from(s, 'latin1');
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(bytes.length, 0);
+    newStrings.push(len, bytes);
+  }
+  const stringTail = Buffer.concat(newStrings);
+  const newEntries = Buffer.concat(entries);
+
+  // The count leads the string table; the rest of it is carried over verbatim.
+  const stringCount = Buffer.alloc(4);
+  stringCount.writeUInt32LE(strings.length + added.length, 0);
+
+  const header = Buffer.from(buf.subarray(0, 24));
+  header.writeUInt32LE(recordTableStart + appendedSize, 4);
+  header.writeUInt32LE(recordTableSize + newEntries.length, 8);
+  header.writeUInt32LE(recordCount + records.length, 12);
+  header.writeUInt32LE(stringTableStart + appendedSize + newEntries.length, 16);
+  header.writeUInt32LE(stringTableSize + stringTail.length, 20);
+
+  return Buffer.concat([
+    header,
+    buf.subarray(24, recordTableStart),
+    ...blocks,
+    buf.subarray(recordTableStart, recordTableStart + recordTableSize),
+    newEntries,
+    stringCount,
+    buf.subarray(stringTableStart + 4, stringTableStart + stringTableSize),
+    stringTail,
+    buf.subarray(stringTableStart + stringTableSize), // the sixteen trailing bytes
+  ]);
+}
+
+export interface ArzValueEdit {
+  /** Record path, as the archive spells it (matched case-insensitively). */
+  record: string;
+  /** Field key. Must already exist on that record, hold one value, and not be a string. */
+  field: string;
+  value: number;
+}
+
+/**
+ * Replace numeric field values in an archive that already exists, leaving every
+ * other byte of it exactly where it was.
+ *
+ * This is how an edit reaches a mod somebody else built. Rebuilding the archive
+ * from its own records is not an option at this size: `writeArz` compresses
+ * literal-only, so a 79 MB mod would come back several times larger, and every
+ * record would have gone through this library's encoder to change three fields.
+ *
+ * The layout makes a surgical patch cheap instead. Only a record's *data
+ * offset* is relative, and it is the only thing about a record the rest of the
+ * file knows: so the new blocks are **appended** after the existing data
+ * section, the record table is copied and the twelve bytes naming offset and
+ * sizes are rewritten for exactly the records that changed, and the string
+ * table, the trailing sixteen bytes, and every other record's compressed block
+ * are carried over untouched. The old blocks stay where they are, unreferenced
+ * — a few hundred dead bytes, against rewriting tens of megabytes.
+ *
+ * The game loads the result — checked by playing it — so the dead blocks are
+ * ignored and the loader trusts the header's offsets rather than deriving
+ * anything from the file's length.
+ *
+ * Consequently no string is ever added: the field keys are already in the
+ * table, and the values are numbers. A field this cannot write that way — a
+ * string, a list, one that is not there — throws rather than being skipped,
+ * because a patch that silently did nothing would be indistinguishable from one
+ * that worked.
+ */
+export function patchArzValues(buf: Buffer, edits: readonly ArzValueEdit[]): Buffer {
+  if (buf.length < 24) throw new Error(`not an .arz archive: ${buf.length} bytes is shorter than the header`);
+  const magic = buf.readUInt16LE(0);
+  const version = buf.readUInt16LE(2);
+  if (magic !== ARZ_MAGIC) throw new Error(`not an .arz archive: magic ${magic} != ${ARZ_MAGIC}`);
+  if (version !== ARZ_VERSION) throw new Error(`unsupported .arz version ${version} (expected ${ARZ_VERSION})`);
+
+  const recordTableStart = buf.readUInt32LE(4);
+  const recordTableSize = buf.readUInt32LE(8);
+  const recordCount = buf.readUInt32LE(12);
+  const stringTableStart = buf.readUInt32LE(16);
+  const strings = readStringTable(buf, stringTableStart);
+
+  const byRecord = new Map<string, ArzValueEdit[]>();
+  for (const edit of edits) {
+    const key = edit.record.toLowerCase();
+    const list = byRecord.get(key);
+    if (list) list.push(edit);
+    else byRecord.set(key, [edit]);
+  }
+
+  // Copied, then patched in place: every entry this does not touch keeps its
+  // bytes rather than being re-encoded from a parse of them.
+  const table = Buffer.from(buf.subarray(recordTableStart, recordTableStart + recordTableSize));
+  const dataSize = recordTableStart - 24;
+  const appended: Buffer[] = [];
+  let appendedSize = 0;
+  const done = new Set<string>();
+
+  let p = 0;
+  for (let i = 0; i < recordCount; i++) {
+    const nameIndex = table.readUInt32LE(p);
+    const typeLen = table.readUInt32LE(p + 4);
+    const at = p + 8 + typeLen;
+    p = at + 12 + 8;
+
+    const record = strings[nameIndex];
+    if (record === undefined) throw new Error(`record ${i}: name index ${nameIndex} is outside the string table`);
+    const wanted = byRecord.get(record.toLowerCase());
+    if (!wanted) continue;
+
+    const dataOffset = table.readUInt32LE(at);
+    const compressedSize = table.readUInt32LE(at + 4);
+    const decompressedSize = table.readUInt32LE(at + 8);
+    const data = decompressLz4Block(
+      buf.subarray(24 + dataOffset, 24 + dataOffset + compressedSize),
+      decompressedSize,
+    );
+    writeRawValues(data, strings, wanted, record);
+
+    const block = compressLz4Literals(data);
+    table.writeUInt32LE(dataSize + appendedSize, at);
+    table.writeUInt32LE(block.length, at + 4);
+    table.writeUInt32LE(data.length, at + 8);
+    appended.push(block);
+    appendedSize += block.length;
+    done.add(record.toLowerCase());
+  }
+
+  for (const record of byRecord.keys()) {
+    if (!done.has(record)) throw new Error(`${record} is not in this archive`);
+  }
+
+  const header = Buffer.from(buf.subarray(0, 24));
+  header.writeUInt32LE(recordTableStart + appendedSize, 4);
+  header.writeUInt32LE(stringTableStart + appendedSize, 16);
+
+  return Buffer.concat([
+    header,
+    buf.subarray(24, recordTableStart), // every existing block, byte for byte
+    ...appended,
+    table,
+    buf.subarray(stringTableStart), // string table and the sixteen trailing bytes
+  ]);
+}
+
+/** Overwrite named values in a decompressed field stream, in place. */
+function writeRawValues(
+  data: Buffer,
+  strings: string[],
+  edits: readonly ArzValueEdit[],
+  record: string,
+): void {
+  const left = new Map(edits.map((e) => [e.field.toLowerCase(), e]));
+  let q = 0;
+  while (q + 8 <= data.length) {
+    const type = data.readUInt16LE(q);
+    const count = data.readUInt16LE(q + 2);
+    const keyIndex = data.readUInt32LE(q + 4);
+    q += 8;
+
+    const key = strings[keyIndex];
+    if (key === undefined) throw new Error(`${record}: field key index ${keyIndex} is outside the string table`);
+    const edit = left.get(key.toLowerCase());
+    if (edit) {
+      if (type === FieldType.String) throw new Error(`${record}.${key} is a string field`);
+      if (count !== 1) throw new Error(`${record}.${key} holds ${count} values, not one`);
+      if (type === FieldType.Float) data.writeFloatLE(Math.fround(edit.value), q);
+      else data.writeInt32LE(Math.round(edit.value), q);
+      left.delete(key.toLowerCase());
+    }
+    q += count * 4;
+  }
+  if (left.size) throw new Error(`${record} has no ${[...left.keys()].join(' or ')} field`);
+}
+
 /**
  * Build an `.arz` from records read by `readArzRaw`.
  *
@@ -424,28 +703,7 @@ export function writeArz(records: readonly RawArzRecord[]): Buffer {
   let dataCursor = 0;
 
   for (const rec of records) {
-    const parts: Buffer[] = [];
-    for (const field of rec.fields) {
-      const head = Buffer.alloc(8);
-      head.writeUInt16LE(field.type, 0);
-      head.writeUInt16LE(field.values.length, 2);
-      head.writeUInt32LE(intern(field.key), 4);
-      parts.push(head);
-
-      const body = Buffer.alloc(field.values.length * 4);
-      field.values.forEach((value, i) => {
-        if (field.type === FieldType.Float) {
-          body.writeFloatLE(value as number, i * 4);
-        } else if (field.type === FieldType.String) {
-          body.writeUInt32LE(intern(value as string), i * 4);
-        } else {
-          body.writeInt32LE(value as number, i * 4);
-        }
-      });
-      parts.push(body);
-    }
-
-    const raw = Buffer.concat(parts);
+    const raw = encodeRawFields(rec, intern);
     const compressed = compressLz4Literals(raw);
     blobs.push(compressed);
     entries.push({

@@ -374,6 +374,18 @@ export interface GameDb {
    */
   skillName(record: string): string | undefined;
   /**
+   * The two-digit number a mastery takes in a character's class tag, from the
+   * `MasteryEnumeration` the mastery record declares (`SkillClass12` → `12`).
+   *
+   * The base game's ten masteries repeat the number in their own record path,
+   * so for those this only confirms what the path already said. A mod's does
+   * not — Path of Grim Dawn's Monk lives at `records/skills/playerclassmonk/`
+   * and takes number 12 — and this is the only place that fact is written down.
+   * Undefined for a record that declares no enumeration, which is the honest
+   * answer for the pseudo-masteries some mods ship.
+   */
+  masteryNumber(record: string): string | undefined;
+  /**
    * Template class for *any* skill record, including the name-only ones that
    * carry no indexed stats. That is what tells a granted-skill line the
    * difference between "we could not expand this" and "this summons a pet, and

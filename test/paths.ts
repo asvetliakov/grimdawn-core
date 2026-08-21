@@ -80,8 +80,9 @@ function fixtureRoster(): string[] {
   const snapshots = existsSync(FIXTURE_DIR)
     ? readdirSync(FIXTURE_DIR)
         // `user-` is the Custom Game tree's prefix, and those are not campaign
-        // characters: a mod's class does not match `playerclassNN`, so one
-        // showing up here reports no masteries and a class tag it cannot explain.
+        // characters: their classes come from a mod, so the number each takes
+        // in the class tag is answerable only with that mod's database loaded.
+        // The tests that do load one reach for them through `customCharacters`.
         .filter((f) => f.endsWith('.gdc') && !f.startsWith('user-'))
         .map((f) => basename(f, '.gdc'))
     : [];

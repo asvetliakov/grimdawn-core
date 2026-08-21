@@ -7,7 +7,7 @@ import { decompressLz4Block, readArz } from '../src/db/arz.js';
 import { cleanText } from '../src/db/build.js';
 import { archivesFingerprint, findGameDir, gameArchives, readGameVersion } from '../src/db/gamefiles.js';
 import { availableLocales, parseTagFile, readGameText } from '../src/db/gametext.js';
-import { loadGameDb } from '../src/db/index.js';
+import { loadGameDb, type NormalizedGameDb } from '../src/db/index.js';
 import { REP_TIERS, type DbItem } from '../src/db/types.js';
 import { MISSING_GAME_MESSAGE, gameDb, haveGameInstall } from './paths.js';
 
@@ -136,6 +136,32 @@ describe.skipIf(!haveGameInstall())(`game database (${haveGameInstall() ? 'live'
     // Same inputs, same key — this is what keeps the cache from re-downloading.
     expect(archivesFingerprint(archives)).toBe(archivesFingerprint(archives));
   });
+
+  it('reads the class-tag number off every mastery, from the data rather than the path', async () => {
+    const db = (await gameDb()) as NormalizedGameDb;
+    const numbers = db.raw.masteryNumbers;
+    const bars = Object.keys(numbers).filter((r) => /^records\/skills\/playerclass/.test(r));
+    expect(bars.length, 'the base game ships ten masteries').toBeGreaterThanOrEqual(10);
+
+    // The base game numbers its masteries in their own paths, so here the two
+    // sources must agree — which is what makes the field trustworthy for a
+    // mod's masteries, where the path says nothing.
+    for (const record of bars) {
+      const fromPath = /playerclass(\d+)\//.exec(record)?.[1];
+      if (fromPath) expect(numbers[record], record).toBe(fromPath.padStart(2, '0'));
+      expect(db.masteryNumber(record), record).toBe(numbers[record]);
+    }
+    expect(db.masteryNumber('records/skills/playerclass01/nosuchskill.dbr')).toBeUndefined();
+  }, BUILD_TIMEOUT);
+
+  it('points every mastery skill at the bar record its tree is named after', async () => {
+    const db = (await gameDb()) as NormalizedGameDb;
+    const bar = Object.keys(db.raw.masteryNumbers).find((r) => /playerclass\d+\//.test(r))!;
+    const tree = bar.slice(0, bar.lastIndexOf('/') + 1);
+    const sibling = Object.keys(db.raw.skills).find((r) => r.startsWith(tree) && r !== bar);
+    if (!sibling) return;
+    expect(db.getSkill(sibling)?.mastery).toBe(bar);
+  }, BUILD_TIMEOUT);
 
   it('parses a known record straight out of the archive', () => {
     const archives = gameArchives(findGameDir()!);

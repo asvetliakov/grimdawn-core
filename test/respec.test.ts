@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { isDevotionRecord, parseGdc, parseGdcRecording } from '../src/save/gdc.js';
+import type { GameDb } from '../src/db/types.js';
 import { characterMasteries, classTagFor } from '../src/save/mastery.js';
 import { planRespec, type RespecScope } from '../src/save/respec.js';
 import { replay } from '../src/save/transcript.js';
@@ -32,10 +33,10 @@ import {
   primaryCharacter,
 } from './paths.js';
 
-function plan(character: string, scope: RespecScope, path = characterSavePath(character)) {
+function plan(character: string, scope: RespecScope, path = characterSavePath(character), db?: GameDb) {
   const source = readFileSync(path);
   const { save, transcript } = parseGdcRecording(source);
-  return { save, source, result: planRespec({ character, save, transcript, source, scope }) };
+  return { save, source, result: planRespec({ character, save, transcript, source, scope, ...(db ? { db } : {}) }) };
 }
 
 /** Everything a respec must not touch, compared field for field. */
@@ -114,6 +115,28 @@ describe.skipIf(!haveSaves())('respec (fixtures)', () => {
     expect(untouched(after)).toEqual(untouched(save));
   });
 
+  // The state this tool leaves a character in, re-planned. It is what the
+  // window shows the moment after a respec succeeds, and reporting it as
+  // "nothing selected" read as though the user had done something wrong.
+  it('says there is nothing left rather than nothing chosen, once it has worked', () => {
+    const character = primaryCharacter();
+    const { result } = plan(character, { masteries: 'all', devotions: true });
+    if (!result.output) return;
+
+    const source = result.output;
+    const { save, transcript } = parseGdcRecording(source);
+    const again = planRespec({
+      character,
+      save,
+      transcript,
+      source,
+      scope: { masteries: 'all', devotions: true },
+    });
+
+    expect(again.refusals).toEqual([{ kind: 'nothing-to-respec', masteries: true, devotions: true }]);
+    expect(again.output).toBeUndefined();
+  });
+
   it('removes one mastery and refunds it, with the other left alone', () => {
     // The case the mastery planner refuses outright: a mastery with points in
     // it, taken back in one edit.
@@ -122,7 +145,7 @@ describe.skipIf(!haveSaves())('respec (fixtures)', () => {
 
     const before = parseGdc(readFileSync(characterSavePath(character)));
     const [target, kept] = characterMasteries(before);
-    const { save, result } = plan(character, { masteries: [target!.classNumber], devotions: false });
+    const { save, result } = plan(character, { masteries: [target!.classKey], devotions: false });
 
     expect(result.refusals).toEqual([]);
     expect(result.skillPointsRefunded).toBe(target!.pointsInvested);
@@ -131,7 +154,7 @@ describe.skipIf(!haveSaves())('respec (fixtures)', () => {
     const after = parseGdc(result.output!);
     expect(after.warnings).toEqual([]);
     expect(after.blocks.filter((b) => !b.checksumOk || b.status !== 'parsed')).toEqual([]);
-    expect(after.classRecord).toBe(classTagFor([kept!]));
+    expect(after.classRecord).toBe(classTagFor([kept!.classNumber!]));
     expect(characterMasteries(after).map((m) => m.classNumber)).toEqual([kept!.classNumber]);
     expect(after.attributes.skillPoints).toBe(save.attributes.skillPoints + target!.pointsInvested);
 
@@ -252,15 +275,57 @@ describe.skipIf(!haveSaves())('respec (fixtures)', () => {
     expect(unknown.result.output).toBeUndefined();
 
     const nothing = plan(character, { masteries: [], devotions: false });
-    expect(nothing.result.refusals).toContainEqual({ kind: 'nothing-to-respec' });
+    expect(nothing.result.refusals).toContainEqual({ kind: 'nothing-selected' });
     expect(nothing.result.output).toBeUndefined();
   });
 });
 
+/**
+ * A database that answers exactly one question: what number a mastery takes in
+ * the class tag. That is all `planRespec` asks a mod's database for, so a stub
+ * of it is a faithful stand-in for one — and unlike the real thing it is here
+ * on every machine, mod installed or not.
+ */
+function numbersDb(numbers: Record<string, string>): GameDb {
+  return {
+    masteryNumber: (record: string) => numbers[record],
+    getSkill: () => undefined,
+    localize: (tag: string) => tag,
+  } as unknown as GameDb;
+}
+
+/** The numbers a save's own class tag spells, two digits at a time. */
+function tagNumbers(classRecord: string): string[] {
+  return classRecord.replace(/^tagSkillClassName/, '').match(/\d{2}/g) ?? [];
+}
+
+/**
+ * Custom Game characters holding a mastery whose number the path cannot give —
+ * a mod's. Found by shape: which mod is installed, and what it calls its
+ * classes, is a fact about the machine and not something to write down here.
+ */
+function modMasterySubjects(): { character: string; path: string; save: CharacterSave; numbers: Record<string, string> }[] {
+  const out = [];
+  for (const character of customCharacters()) {
+    const path = customCharacterSavePath(character);
+    const save = parseGdc(readFileSync(path));
+    const masteries = characterMasteries(save);
+    if (!masteries.length || masteries.some((m) => m.classNumber !== undefined)) continue;
+    // One mastery, one number in the tag: the save states which number this
+    // record takes, which is precisely what the mod's database would say.
+    const numbers = tagNumbers(save.classRecord);
+    if (masteries.length !== 1 || numbers.length !== 1) continue;
+    out.push({ character, path, save, numbers: { [masteries[0]!.record]: numbers[0]! } });
+  }
+  return out;
+}
+
+const MOD_SUBJECTS = haveCustomSaves() ? modMasterySubjects() : [];
+
 describe.skipIf(!haveCustomSaves())('respec on a Custom Game character', () => {
   if (!haveCustomSaves()) it.skip('no Custom Game characters on this machine', () => {});
 
-  it('refunds devotions, and reports that a mod’s mastery is not one it can name', () => {
+  it('refunds devotions with no database at all, leaving the class tag alone', () => {
     for (const character of customCharacters()) {
       const path = customCharacterSavePath(character);
       const before = parseGdc(readFileSync(path));
@@ -268,16 +333,76 @@ describe.skipIf(!haveCustomSaves())('respec on a Custom Game character', () => {
 
       const { result } = plan(character, { masteries: [], devotions: true }, path);
 
-      // A mod's mastery lives at `records/skills/playerclassmonk/` — no digits —
-      // so `playerclassNN` does not match it and this character reports none.
-      // The devotion half needs nothing from the mod's database and works.
-      expect(characterMasteries(before), character).toEqual([]);
+      // The devotion half needs nothing from the mod's database: it takes no
+      // mastery away, so it rewrites no class tag and has no number to resolve.
       expect(result.refusals, character).toEqual([]);
+      expect(result.classRecordAfter, character).toBe(before.classRecord);
 
       const after = parseGdc(result.output!);
       expect(after.warnings, character).toEqual([]);
       expect(after.blocks.filter((b) => !b.checksumOk || b.status !== 'parsed'), character).toEqual([]);
       expect(after.devotions, character).toEqual([]);
+    }
+  });
+
+  it.runIf(MOD_SUBJECTS.length)('reads a mod’s mastery off the skill list, number unknown', () => {
+    for (const { character, save } of MOD_SUBJECTS) {
+      const [mastery] = characterMasteries(save);
+      // The directory is the class key and the save carries it; the number it
+      // takes in the tag is a fact about the mod's database, and absent here.
+      expect(mastery!.classKey, character).not.toMatch(/^\d+$/);
+      expect(mastery!.classNumber, character).toBeUndefined();
+      expect(mastery!.barLevel, character).toBeGreaterThan(0);
+    }
+  });
+
+  it.runIf(MOD_SUBJECTS.length)('refuses to respec it when the mod’s database was not loaded', () => {
+    for (const { character, path, save } of MOD_SUBJECTS) {
+      const { result } = plan(character, { masteries: 'all', devotions: false }, path);
+      expect(result.refusals, character).toContainEqual({
+        kind: 'unknown-class-number',
+        record: characterMasteries(save)[0]!.record,
+      });
+      expect(result.output, character).toBeUndefined();
+    }
+  });
+
+  it.runIf(MOD_SUBJECTS.length)('respecs it once the mod’s database names the number', () => {
+    for (const { character, path, save, numbers } of MOD_SUBJECTS) {
+      const db = numbersDb(numbers);
+      const { result } = plan(character, { masteries: 'all', devotions: true }, path, db);
+
+      expect(result.refusals, character).toEqual([]);
+      expect(result.removedMasteries.map((m) => m.record), character).toEqual(Object.keys(numbers));
+      expect(result.skillPointsRefunded, character).toBeGreaterThan(0);
+
+      const after = parseGdc(result.output!);
+      expect(after.warnings, character).toEqual([]);
+      expect(after.blocks.filter((b) => !b.checksumOk || b.status !== 'parsed'), character).toEqual([]);
+      expect(after.blocks.map((b) => b.id), character).toEqual(save.blocks.map((b) => b.id));
+
+      // The one mastery it had is gone, so the character carries no class tag —
+      // the state the game puts a character in before one is chosen.
+      expect(after.classRecord, character).toBe('');
+      expect(characterMasteries(after), character).toEqual([]);
+      expect(after.skillEntries.filter((e) => /playerclass/i.test(e.record)), character).toEqual([]);
+      expect(after.attributes.skillPoints, character).toBe(save.attributes.skillPoints + result.skillPointsRefunded);
+      expect(untouched(after), character).toEqual(untouched(save));
+    }
+  });
+
+  it.runIf(MOD_SUBJECTS.length)('refuses a number that does not add up to the tag on the save', () => {
+    for (const { character, path, save, numbers } of MOD_SUBJECTS) {
+      const record = Object.keys(numbers)[0]!;
+      const wrong = numbers[record] === '02' ? '03' : '02';
+      const { result } = plan(character, { masteries: 'all', devotions: false }, path, numbersDb({ [record]: wrong }));
+
+      expect(result.refusals, character).toContainEqual({
+        kind: 'class-tag-mismatch',
+        expected: classTagFor([wrong]),
+        actual: save.classRecord,
+      });
+      expect(result.output, character).toBeUndefined();
     }
   });
 });

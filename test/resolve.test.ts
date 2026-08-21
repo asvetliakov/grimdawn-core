@@ -42,6 +42,7 @@ function stubDb(items: Record<string, DbItem>, affixes: Record<string, string>):
         ? { record, stats: {}, ...(affixes[record] ? { name: affixes[record]! } : {}) }
         : undefined,
     getSkill: () => undefined,
+    masteryNumber: () => undefined,
     getSet: () => undefined,
     skillName: () => undefined,
     skillClass: () => undefined,

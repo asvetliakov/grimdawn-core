@@ -36,7 +36,14 @@ import {
   encodeHeader,
   isDevotionRecord,
 } from './gdc.js';
-import { characterMasteries, classTagFor, masteryClassNumber, type MasteryRef } from './mastery.js';
+import {
+  characterMasteries,
+  classTagFor,
+  masteryClassKey,
+  reconcileClassNumbers,
+  type MasteryModelRefusal,
+  type MasteryRef,
+} from './mastery.js';
 import { replay, spliceRegion, type Seg, type Transcript } from './transcript.js';
 import type { CharacterSave, CharacterSkill, HotSlot, SkillSet } from './types.js';
 
@@ -44,7 +51,7 @@ import type { CharacterSave, CharacterSkill, HotSlot, SkillSet } from './types.j
 export interface RespecScope {
   /**
    * `'all'` for every mastery the character has, or specific ones by record
-   * path, class number or localized name. An empty list removes no mastery,
+   * path, class key (`04`, `monk`), class number or localized name. An empty list removes no mastery,
    * which is how a devotions-only respec is asked for.
    */
   masteries: 'all' | string[];
@@ -54,8 +61,10 @@ export interface RespecScope {
 
 export type RespecRefusal =
   | SaveEditRefusal
+  | MasteryModelRefusal
   | { kind: 'unknown-mastery'; record: string }
-  | { kind: 'nothing-to-respec' }
+  | { kind: 'nothing-selected' }
+  | { kind: 'nothing-to-respec'; masteries: boolean; devotions: boolean }
   | { kind: 'devotion-ledger-mismatch'; unspent: number; refunded: number; total: number };
 
 export interface RemovedEntry {
@@ -125,20 +134,21 @@ export function planRespec(input: RespecPlanInput): RespecPlan {
       const found = masteries.find(
         (m) =>
           m.record.toLowerCase() === key ||
-          m.classNumber === key.padStart(2, '0') ||
+          m.classKey.toLowerCase() === key ||
+          (m.classNumber !== undefined && m.classNumber === key.padStart(2, '0')) ||
           (m.name ?? '').toLowerCase() === key,
       );
       if (found) {
-        if (!targets.some((t) => t.classNumber === found.classNumber)) targets.push(found);
+        if (!targets.some((t) => t.classKey === found.classKey)) targets.push(found);
       } else {
         refusals.push({ kind: 'unknown-mastery', record: wanted });
       }
     }
   }
 
-  const goingClasses = new Set(targets.map((m) => m.classNumber));
+  const goingClasses = new Set(targets.map((m) => m.classKey));
   const isGoing = (entry: CharacterSkill): boolean => {
-    const cls = masteryClassNumber(entry.record);
+    const cls = masteryClassKey(entry.record);
     if (cls !== undefined && goingClasses.has(cls)) return true;
     return scope.devotions && isDevotionRecord(entry.record);
   };
@@ -157,11 +167,26 @@ export function planRespec(input: RespecPlanInput): RespecPlan {
   const skillRefund = removedSkills.reduce((n, e) => n + Math.max(0, e.level), 0);
   const devotionRefund = removedDevotions.reduce((n, e) => n + Math.max(0, e.level), 0);
 
-  const remaining = masteries.filter((m) => !goingClasses.has(m.classNumber));
+  const remaining = masteries.filter((m) => !goingClasses.has(m.classKey));
   const classRecordBefore = save.classRecord;
+
+  // Rewriting the tag means naming every class the character keeps, so the
+  // numbers are resolved and checked against the tag they already carry — but
+  // only when a mastery is actually going. A devotions-only respec leaves the
+  // tag alone, and must keep working on a mod's character with no mod database
+  // loaded, which is exactly the case that cannot resolve a number.
+  const model = targets.length
+    ? reconcileClassNumbers(masteries, classRecordBefore, db)
+    : { numbers: new Map<string, string>(), refusals: [] as MasteryModelRefusal[] };
+
   // With no mastery left the character carries no class tag at all, which is
   // what a character who has not chosen one yet looks like.
-  const classRecordAfter = targets.length ? classTagFor(remaining) : classRecordBefore;
+  // `numbers` is present only when *every* current mastery resolved, so each
+  // one the character keeps is in it. A `?? ''` here would turn a hole in that
+  // invariant into a plausible-looking wrong tag.
+  const numbers = model.numbers;
+  const classRecordAfter =
+    targets.length && numbers ? classTagFor(remaining.map((m) => numbers.get(m.classKey)!)) : classRecordBefore;
 
   const going = new Set(removed.map((e) => e.record.toLowerCase()));
   const survivors = save.skillEntries.filter((e) => !isGoing(e));
@@ -182,10 +207,22 @@ export function planRespec(input: RespecPlanInput): RespecPlan {
 
   // --- what stands in the way -------------------------------------------
   refusals.push(...saveEditRefusals(save, transcript, source));
+  refusals.push(...model.refusals);
 
+  // Two different nothings, and telling a user they are the same is how the
+  // one that follows a *successful* respec came to read as a mistake they had
+  // made. Asking for nothing is a slip to correct; asking for everything on a
+  // character who has nothing left is the honest end state of this tool having
+  // already worked. A mastery always holds at least the point in its bar, so
+  // "masteries were in scope and none came back" means the character has none.
+  const wantsMasteries = scope.masteries === 'all' || scope.masteries.length > 0;
   const changes = removed.length > 0 || clearedBindings.length > 0;
   if (!changes && !refusals.some((r) => r.kind === 'unknown-mastery')) {
-    refusals.push({ kind: 'nothing-to-respec' });
+    refusals.push(
+      wantsMasteries || scope.devotions
+        ? { kind: 'nothing-to-respec', masteries: wantsMasteries, devotions: scope.devotions }
+        : { kind: 'nothing-selected' },
+    );
   }
 
   // Wiping every devotion must land the character on exactly the devotion

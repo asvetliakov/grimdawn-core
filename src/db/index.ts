@@ -20,7 +20,8 @@ import {
 } from './gamefiles.js';
 import { buildDb, cleanText, readGameRecords, type NormalizedDb } from './build.js';
 import { clearCachedBuild, readCachedDb, writeCachedDb } from './cache.js';
-import { DEFAULT_LOCALE, availableLocales, readGameText } from './gametext.js';
+import { DEFAULT_LOCALE, availableLocales, readGameText, readModText } from './gametext.js';
+import { modArchive } from './mods.js';
 import {
   REP_TIERS,
   type DbAffix,
@@ -45,6 +46,18 @@ export interface LoadDbOptions {
   locale?: string;
   /** Re-download and rebuild even when a cache exists. */
   refresh?: boolean;
+  /**
+   * Also read an installed mod's own database, last.
+   *
+   * A mod overrides the game record for record, so this is the same last-wins
+   * overlay the expansions already are — `mods/<name>/database/<name>.arz`
+   * appended to the load order — and it is how a Custom Game character's
+   * classes, skills and names become answerable at all. It participates in the
+   * fingerprint, so a mod-aware database caches beside the plain one rather
+   * than over it: the AI Companion shares this cache and asks only about the
+   * campaign.
+   */
+  mod?: string;
   /** Called with progress notes; the CLI prints them, the UI can show them. */
   onProgress?: (message: string) => void;
 }
@@ -60,7 +73,9 @@ export async function loadNormalizedDb(opts: LoadDbOptions = {}): Promise<Normal
   const gameDir = opts.gameDir ?? findGameDir();
   if (!gameDir) throw new Error(MISSING_GAME_DIR_MESSAGE);
 
+  // The game's archives, then the mod's — load order and override order both.
   const archives = gameArchives(gameDir);
+  if (opts.mod) archives.push(modArchive(gameDir, opts.mod));
   const fingerprint = archivesFingerprint(archives);
 
   if (opts.refresh) clearCachedBuild(fingerprint);
@@ -76,7 +91,13 @@ export async function loadNormalizedDb(opts: LoadDbOptions = {}): Promise<Normal
   const game = readGameRecords(archives);
   note(`${game.records.size} records`);
 
-  const l10n = readGameText(gameDir, locale, archives);
+  // Text follows the same order, but not the same paths: an expansion's sits
+  // under its own folder in the install, a mod's inside `mods/<name>/`.
+  const l10n = readGameText(gameDir, locale, gameArchives(gameDir));
+  if (opts.mod) {
+    const modTexts = readModText(gameDir, opts.mod, locale, l10n);
+    note(modTexts ? `mod "${opts.mod}" text folded in` : `mod "${opts.mod}" ships no ${locale} text`);
+  }
   note(`${Object.keys(l10n).length} localized tags (${locale})`);
 
   const db = buildDb({
@@ -131,6 +152,10 @@ export class NormalizedGameDb implements GameDb {
 
   skillName(record: string): string | undefined {
     return this.db.skillNames[record]?.[0] || undefined;
+  }
+
+  masteryNumber(record: string): string | undefined {
+    return this.db.masteryNumbers?.[record];
   }
 
   skillClass(record: string): string | undefined {

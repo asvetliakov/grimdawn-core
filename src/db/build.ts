@@ -31,7 +31,7 @@ import {
 } from './types.js';
 
 /** Bump when the shape below changes so stale caches rebuild instead of misreading. */
-export const DB_SCHEMA_VERSION = 13;
+export const DB_SCHEMA_VERSION = 14;
 
 export interface NormalizedDb {
   schemaVersion: number;
@@ -57,6 +57,15 @@ export interface NormalizedDb {
    * is cheap enough to hold all of them; full stats are the `skills` subset.
    */
   skillNames: Record<string, [string, string]>;
+  /**
+   * Mastery record → the two-digit number it takes in a character's class tag,
+   * from the `MasteryEnumeration` the record declares. The base game's ten
+   * repeat that number in their own path; a mod's does not, and for those this
+   * is the only place the fact is written down. A mastery that declares no
+   * enumeration is simply absent, which reads downstream as "unknown" — a
+   * refusal rather than a guess.
+   */
+  masteryNumbers: Record<string, string>;
   sets: Record<string, DbSet>;
   /** Difficulty name → raw `defensive*` field → the (negative) penalty it takes. */
   difficultyPenalty: Record<string, Record<string, number>>;
@@ -281,12 +290,32 @@ const AFFIX_CLASS = 'LootRandomizer';
 const ITEM_SET_TEMPLATE = 'database/templates/itemset.tpl';
 
 /**
- * Skill subtrees indexed with their full per-rank stats: the two mastery trees a
+ * Skill subtrees indexed with their full per-rank stats: the mastery trees a
  * character can pick and the devotion constellation. Everything else under
  * `records/skills/` (monster skills, the potion tables) is name-only — plus
  * whatever items point at, which `buildSkills` pulls in below.
+ *
+ * `playerclass[^/]+` rather than `playerclass\d+`: a mod names its masteries
+ * (`playerclassmonk`) where the base game numbers them, and a Custom Game
+ * character's skills are exactly as much in scope as a campaign character's.
+ * The twin of this rule lives in `save/mastery.ts`, which decides the same
+ * membership from the other side of the layering — the two are kept in step by
+ * hand because `src/save` may not import from here at runtime.
  */
-const DEEP_SKILL_PREFIX = /^records\/skills\/(playerclass\d+|devotion)\//;
+const DEEP_SKILL_PREFIX = /^records\/skills\/(playerclass[^/]+|devotion)\//;
+
+/**
+ * How a mastery record spells the class it is: the template class every one of
+ * them declares, and the `SkillClass12`-shaped enumeration carrying the number
+ * it takes in a character's class tag.
+ */
+const MASTERY_CLASS = 'Skill_Mastery';
+const MASTERY_ENUMERATION = /^SkillClass(\d+)$/i;
+
+/** The class key a mastery-tree record belongs to; see `save/mastery.ts`. */
+const SKILL_CLASS_KEY = /^records\/skills\/playerclass([^/]+)\//i;
+/** …and which entry in that tree is the bar the tree is named after. */
+const SKILL_CLASS_BAR = /\/_classtraining_[^/]*\.dbr$/i;
 
 /**
  * Pets are out of scope (see the stage plan's exclusion list) and they are also
@@ -748,6 +777,7 @@ export function buildDb(input: BuildInput): NormalizedDb {
   }
 
   const skills = buildSkills(records, skillNames, referencedSkills, localize);
+  const masteryNumbers = buildMasteryNumbers(records);
   const sets = buildSets(records, localize);
   const difficultyPenalty = buildDifficultyPenalty(records);
   const armorAbsorptionBase =
@@ -776,6 +806,7 @@ export function buildDb(input: BuildInput): NormalizedDb {
     affixes,
     skills,
     skillNames,
+    masteryNumbers,
     sets,
     difficultyPenalty,
     armorAbsorptionBase,
@@ -822,12 +853,39 @@ function buildSkillNames(
 }
 
 /**
- * `records/skills/playerclass04/x.dbr` → that mastery's training record, which
- * is what a `+N to all <mastery> skills` bonus names.
+ * Class key → the mastery's own training record, which is what a `+N to all
+ * <mastery> skills` bonus names.
+ *
+ * Found rather than composed. The obvious construction —
+ * `_classtraining_class${key}.dbr` — holds for the base game and breaks on the
+ * first mod that names its bar anything else, and Path of Grim Dawn ships
+ * exactly that (`playerclassrunewords/_classtraining_runewords.dbr`).
  */
-function masteryOf(path: string): string | undefined {
-  const match = /^records\/skills\/(playerclass(\d+))\//.exec(path);
-  return match ? `records/skills/${match[1]}/_classtraining_class${match[2]}.dbr` : undefined;
+function masteryBars(records: Map<string, ArzRecord>): Map<string, string> {
+  const bars = new Map<string, string>();
+  for (const path of records.keys()) {
+    const key = SKILL_CLASS_KEY.exec(path)?.[1];
+    if (key !== undefined && SKILL_CLASS_BAR.test(path)) bars.set(key.toLowerCase(), path);
+  }
+  return bars;
+}
+
+/**
+ * Mastery record → the class-tag number it declares.
+ *
+ * `MasteryEnumeration` is how the game data itself spells the number, on both
+ * the base game's masteries and a mod's, so it is the one source that answers
+ * for both. A mastery record without it — some mods ship pseudo-masteries that
+ * are really UI pages — gets no entry, which downstream is "unknown", not zero.
+ */
+function buildMasteryNumbers(records: Map<string, ArzRecord>): Record<string, string> {
+  const numbers: Record<string, string> = {};
+  for (const [path, rec] of records) {
+    if (str(rec, 'Class') !== MASTERY_CLASS) continue;
+    const digits = MASTERY_ENUMERATION.exec(str(rec, 'MasteryEnumeration') ?? '')?.[1];
+    if (digits !== undefined) numbers[path] = digits.padStart(2, '0');
+  }
+  return numbers;
 }
 
 /**
@@ -868,6 +926,7 @@ function buildSkills(
   referenced: Set<string>,
   localize: Localize,
 ): Record<string, DbSkill> {
+  const bars = masteryBars(records);
   const inScope = (path: string): boolean =>
     !PET_SKILL_PATH.test(path) && !UNINDEXED_SKILL_CLASS.test(skillNames[path]?.[1] ?? '');
 
@@ -908,8 +967,9 @@ function buildSkills(
     const buff = str(rec, 'buffSkillName');
     if (buff) skill.buffRecord = buff;
 
-    const mastery = masteryOf(path);
-    if (mastery && records.has(mastery)) skill.mastery = mastery;
+    const classKey = SKILL_CLASS_KEY.exec(path)?.[1];
+    const mastery = classKey === undefined ? undefined : bars.get(classKey.toLowerCase());
+    if (mastery) skill.mastery = mastery;
 
     const weapons = WEAPON_FIELDS.filter((field) => num(rec, field));
     if (weapons.length) skill.weapons = [...weapons];

@@ -2,14 +2,79 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { parseGdc, parseGdcRecording } from '../src/save/gdc.js';
-import { characterMasteries, classTagFor, planMasteryRemoval } from '../src/save/mastery.js';
+import type { GameDb } from '../src/db/types.js';
+import {
+  characterMasteries,
+  classTagFor,
+  planMasteryRemoval,
+  reconcileClassNumbers,
+  type MasteryRef,
+} from '../src/save/mastery.js';
 import { CHARACTERS, MISSING_SAVES_MESSAGE, characterSavePath, characterWith, haveSaves } from './paths.js';
 
 describe('classTagFor', () => {
   it('concatenates the class numbers in ascending order', () => {
-    expect(classTagFor([{ classNumber: '10' }, { classNumber: '04' }])).toBe('tagSkillClassName0410');
-    expect(classTagFor([{ classNumber: '10' }])).toBe('tagSkillClassName10');
+    expect(classTagFor(['10', '04'])).toBe('tagSkillClassName0410');
+    expect(classTagFor(['10'])).toBe('tagSkillClassName10');
     expect(classTagFor([])).toBe('');
+  });
+
+  // A mod's masteries take numbers the same way: Path of Grim Dawn's Monk is
+  // 12 and its Tempest 38, and holding both is tagSkillClassName1238.
+  it('does not care that a number came from a mod', () => {
+    expect(classTagFor(['38', '12'])).toBe('tagSkillClassName1238');
+  });
+});
+
+describe('reconcileClassNumbers', () => {
+  const monk: MasteryRef = {
+    record: 'records/skills/playerclassmonk/_classtraining_classmonk.dbr',
+    classKey: 'monk',
+    barLevel: 1,
+    entryCount: 1,
+    pointsInvested: 1,
+  };
+  const soldier: MasteryRef = { ...monk, record: 'records/skills/playerclass01/_classtraining_class01.dbr', classKey: '01', classNumber: '01' };
+  const db = (numbers: Record<string, string>) =>
+    ({ masteryNumber: (record: string) => numbers[record] }) as unknown as GameDb;
+
+  it('takes a numbered class from its own path, with no database at all', () => {
+    const { numbers, refusals } = reconcileClassNumbers([soldier], 'tagSkillClassName01');
+    expect(refusals).toEqual([]);
+    expect(numbers?.get('01')).toBe('01');
+  });
+
+  it('refuses a mod’s mastery when the database that names it was not loaded', () => {
+    const { numbers, refusals } = reconcileClassNumbers([monk], 'tagSkillClassName12');
+    expect(refusals).toEqual([{ kind: 'unknown-class-number', record: monk.record }]);
+    expect(numbers).toBeUndefined();
+  });
+
+  it('resolves it from the mod’s database when that is loaded', () => {
+    const { numbers, refusals } = reconcileClassNumbers(
+      [monk],
+      'tagSkillClassName12',
+      db({ [monk.record]: '12' }),
+    );
+    expect(refusals).toEqual([]);
+    expect(numbers?.get('monk')).toBe('12');
+  });
+
+  // The point of the check: numbers that do not recompose the tag the save
+  // already carries mean a mastery is being looked straight past, and rewriting
+  // the tag from that view would delete it.
+  it('refuses when the numbers do not add up to the tag on the save', () => {
+    const { refusals } = reconcileClassNumbers([monk], 'tagSkillClassName1238', db({ [monk.record]: '12' }));
+    expect(refusals).toEqual([
+      { kind: 'class-tag-mismatch', expected: 'tagSkillClassName12', actual: 'tagSkillClassName1238' },
+    ]);
+  });
+
+  it('refuses when the path and the database disagree', () => {
+    const { refusals } = reconcileClassNumbers([soldier], 'tagSkillClassName01', db({ [soldier.record]: '07' }));
+    expect(refusals).toEqual([
+      { kind: 'class-number-conflict', record: soldier.record, fromPath: '01', fromDb: '07' },
+    ]);
   });
 });
 
@@ -71,9 +136,13 @@ describe.skipIf(!haveSaves())('removing a mastery (live saves)', () => {
       // Membership is decided by record path, and the header tag is derived from
       // exactly the set that walk finds — if the two ever disagree, an edit
       // would write a class tag for a character it is not describing.
-      expect(save.classRecord, character).toBe(classTagFor(masteries));
+      expect(save.classRecord, character).toBe(classTagFor(masteries.map((m) => m.classNumber!)));
       for (const m of masteries) {
-        expect(m.record, character).toMatch(/^records\/skills\/playerclass\d+\//i);
+        // A campaign character's masteries are the numbered ones, and the number
+        // in the path is the number in the tag. A mod's are neither, which is
+        // what the Custom Game cases in respec.test.ts cover.
+        expect(m.record, character).toMatch(/^records\/skills\/playerclass[^/]+\//i);
+        expect(m.classNumber, character).toBe(m.classKey.padStart(2, '0'));
       }
     }
   });
@@ -90,8 +159,8 @@ describe.skipIf(!haveSaves())('removing a mastery (live saves)', () => {
     // was refunded in game before this operation would agree to run.
     expect(result.skillPointsRefunded).toBe(1);
     expect(result.skillPointsAfter).toBe(save.attributes.skillPoints + 1);
-    expect(result.classRecordBefore).toBe(classTagFor(before));
-    expect(result.classRecordAfter).toBe(classTagFor(remaining));
+    expect(result.classRecordBefore).toBe(classTagFor(before.map((m) => m.classNumber!)));
+    expect(result.classRecordAfter).toBe(classTagFor(remaining.map((m) => m.classNumber!)));
     // A binding lives on the host skill and names a devotion, so removing a
     // mastery takes its bindings with it. Anything else means the model is off.
     expect(result.danglingReferences).toEqual([]);
@@ -113,7 +182,9 @@ describe.skipIf(!haveSaves())('removing a mastery (live saves)', () => {
     expect(after.blocks.filter((b) => !b.checksumOk || b.status !== 'parsed')).toEqual([]);
     expect(after.blocks.map((b) => b.id)).toEqual(save.blocks.map((b) => b.id));
 
-    expect(after.classRecord).toBe(classTagFor(characterMasteries(save).filter((m) => m.record !== record)));
+    expect(after.classRecord).toBe(
+      classTagFor(characterMasteries(save).filter((m) => m.record !== record).map((m) => m.classNumber!)),
+    );
     expect(after.attributes.skillPoints).toBe(save.attributes.skillPoints + 1);
     expect(after.skillEntries).toHaveLength(save.skillEntries.length - 1);
     expect(after.skillEntries.filter((e) => owns.test(e.record))).toEqual([]);
@@ -154,7 +225,7 @@ describe.skipIf(!haveSaves())('removing a mastery (live saves)', () => {
     if (!single) return; // every character here is dual-class; nothing to prove
 
     const only = characterMasteries(parseGdc(readFileSync(characterSavePath(single))))[0]!;
-    const { result } = plan(single, only.classNumber);
+    const { result } = plan(single, only.classKey);
 
     expect(result.refusals).toEqual([{ kind: 'last-mastery' }]);
     expect(result.output).toBeUndefined();

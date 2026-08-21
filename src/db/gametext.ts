@@ -88,6 +88,51 @@ export function readGameText(gameDir: string, locale: string, archives: GameArch
   return tags;
 }
 
+/**
+ * A mod's own text, folded over the game's.
+ *
+ * Mods ship their tags the same way the game does — an `.arc` of `key=value`
+ * files under `resources/` — with one difference that matters: the filename is
+ * whatever the author typed. Path of Grim Dawn's is `text_en.arc` where the
+ * game's is `Text_EN.arc`, and on a case-sensitive filesystem a composed path
+ * finds neither, so the directory is listed and matched instead.
+ *
+ * Absent text is not an error. The archive is what a mod is loaded *for*, and
+ * a mod with no translation for this locale leaves its tags rendering as
+ * themselves — which is worse than a name and far better than a refusal.
+ * Returns how many archives were folded in, for the progress note.
+ */
+export function readModText(
+  gameDir: string,
+  mod: string,
+  locale: string,
+  tags: Record<string, string>,
+): number {
+  const dir = join(gameDir, 'mods', mod, 'resources');
+  const wanted = textArchiveName(locale).toLowerCase();
+  let found = 0;
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  for (const file of files) {
+    if (file.toLowerCase() !== wanted) continue;
+    found++;
+    const archive = ArcArchive.open(join(dir, file));
+    try {
+      for (const name of archive.names()) {
+        if (!name.toLowerCase().endsWith('.txt')) continue;
+        parseTagFile(archive.read(name)!.toString('utf8'), tags);
+      }
+    } finally {
+      archive.close();
+    }
+  }
+  return found;
+}
+
 /** Fold one `tags_*.txt` into `tags`. Exported for the tests. */
 export function parseTagFile(text: string, tags: Record<string, string> = {}): Record<string, string> {
   for (const raw of text.split('\n')) {

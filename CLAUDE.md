@@ -1,0 +1,85 @@
+# @grimdawn/core
+
+Grim Dawn's file formats, as a library: character saves (read **and** write), the item database extracted from the game's own archives, icon extraction, and finding where the game and its saves live. Developed on macOS (the game runs under CrossOver; this code runs natively) and used by two apps that sit beside this directory:
+
+- **`../grimdawn`** — Grim Dawn AI Companion, a read-only advisor.
+- **`../grimdawn-patcher`** — Grim Dawn Patcher, which owns every operation that writes to a save or to the game's data.
+
+Both consume this package as `"@grimdawn/core": "file:../grimdawn-core"`. **The three directories must be checked out as siblings** or `npm install` in either app fails.
+
+## What this package is
+
+**Source-only, no build step.** `exports` points at `./src/*.ts` and every consumer compiles the TypeScript itself (tsx, electron-vite, vitest, `tsc --noEmit` with `moduleResolution: "bundler"`). There is no `dist/`, no declaration emit and no watch-rebuild loop; editing a file here is immediately live in both apps.
+
+**It stays bundled, never externalized.** In an Electron app this package belongs in `devDependencies` with `externalizeDepsPlugin({ exclude: ['@grimdawn/core'] })`, so it compiles into `out/main/index.cjs`. Listed as a runtime dependency it would be `require()`d at runtime from a symlink that does not survive asar packaging.
+
+**Zero runtime dependencies.** The `.arz`/`.arc` readers, LZ4, the DDS decoder and the PNG encoder are hand-written against `node:zlib` and friends. No native modules means no Electron ABI rebuilds. Keep it that way: a published data dump lags the installed build, which is the mistake this code has already had to undo twice.
+
+**No network, ever.** Everything comes from the install. There is no `fetch` here and there must never be one.
+
+**No Electron, no DOM.** Pure Node. The apps' renderers compile with `types: []` and reach this code only through their own IPC DTOs.
+
+## Layout
+
+```
+src/
+  index.ts          thin barrel: paths, platform roots, parseGdc, the save types
+  paths.ts          save tree locations, SaveTree, findSaveDir(s), listCharacters
+  platform.ts       windowsRoots / steamRoots / documentRoots — composed, not written out
+  save/             the save format (see below)
+  db/               .arz/.arc readers, the normalized GameDb, its on-disk cache
+  icons/            .tex → DDS → PNG, and the icon service
+  resolve.ts        the db↔save join: ItemInstance + DbItem → ResolvedItem
+  grid.ts           container dimensions
+  watcher.ts        fs.watch over the save tree → domain events
+```
+
+`src/save` depends on nothing outside itself except `paths.ts` (for `SaveTree`) and two *type-only* imports of `GameDb`. `db` depends on `platform.ts`. `icons` depends on `db`'s archive plumbing, not on `GameDb`. Nothing depends on `resolve.ts`. Keep those edges; they are what let an app take the save writer without the item database.
+
+## The save format — hard-won, do not re-litigate
+
+- Save files use a seeded XOR stream cipher; **every block ends with a checksum that must equal the running cipher state**. A passing checksum is proof the parser consumed the block correctly — treat checksum assertions as the primary test. Unknown block IDs must be skipped (cipher state still advanced), never fatal. **The parsers do not throw on a torn write**: a half-written save comes back as an ordinary `CharacterSave` with `checksumOk: false` on a block, which is why a watcher must check `parseProblem` rather than catching exceptions.
+- The cipher state advances over **ciphertext** bytes, not plaintext. Block lengths are read XOR-state **without** advancing.
+- **The same ciphertext decodes differently depending on the width it is read at, and that is what makes writing a save hard.** `readU32` xors the whole 32-bit state; four `readByte`s xor `state & 0xff` and advance in between. So a region captured bytewise and re-enciphered from a *different* state still checksums — both widths advance over the same bytes — and every u32, float and string length inside it is silently garbage (probed: a `deadbeef` payload came back `9c9eb8ef` after one word changed upstream; `test/transcript.test.ts` pins it). Consequences: **a byte-identical no-op round trip proves nothing about edits**, and "this skipped block contains no non-advancing words" is true and irrelevant — the hazard is unknown *field widths*, not non-advancing words. Hence `transcript.ts`'s two plaintext segment kinds: **`u8`** (bytes a decoder *chose* to read as bytes — width-known, replays at any state) and **`opaque`** (what `skipBlockBody` hands back — width-unknown), with `replay` throwing `OpaqueRegionError` the moment an opaque region would follow an edit. Never merge them.
+- The second guard is **`spliceRegion`**, which encodes the **unedited** save and requires it to be a structural prefix of what was read before substituting the edited encoding — an encoder that has drifted from its decoder refuses rather than writing a plausible wrong file. This is why the encoders live in `gdc.ts` beside their decoders, and why a new one must too.
+- **All fifteen `player.gdc` blocks are decoded, and that is a requirement rather than completionism.** The class tag is in the *header*, so a mastery removal puts the whole file downstream of the edit. Widths were established by cross-state agreement, not by guessing: block 5's "current respawn" UIDs are members of its own list at byte width and not at word width, and all 72 of block 6's riftgate UIDs match across characters at byte width and none at word width — **a UID is sixteen byte reads, not four words**. The archaeology tool worth remembering is the **low-byte trick**: the first byte of a u32 always decodes bytewise to that u32's true low byte, so a bytewise dump of a block shows every string length word and every `0`/`-1` field, which pins the alignment. Blocks 5/6/7/17 are UID lists (**17 has six lists, not three**), 12/10 string lists, 15 a number list, 16 ends in three greatest-monster-killed records + 22 words + a byte. File order is `1 2 3 4 5 6 7 17 8 12 13 14 15 16 10`, and only 3 and 4 nest.
+- **Block 8 interleaves skills and devotions in file order**, so `skills.concat(devotions)` is *not* a valid re-encoding — `CharacterSave.skillEntries` is the file's array and `skills`/`devotions` are views over it. Devotion membership is `isDevotionRecord` (a `/devotion/` path). Its two trailing words are genuine u32 zeros. And **the byte after `enabled` is not padding**, despite what the parser said for six stages: it is 1 on exactly the 32 GDX3 potion-modifier entries, and is kept as `unknown1`.
+- **Block 16 carries a skills map, and it is empty on every campaign character.** That is why 19 words + a zero count + the two endless-dungeon currencies read identically to 22 blind words for as long as only campaign saves were looked at. A **Custom Game** character fills it, and then the blind read walks into the string: every field after it decodes at the wrong width, the block still checksums because the trailing drain swallows the difference, and the only symptom is a byte left `opaque` at the end. Layout: `19 u32 · count · count × (record string, u32) · 2 u32 · 1 byte · drain`.
+- **Block 14's hotbar length is not a constant.** It read as 46 for as long as only two characters were looked at, and 46 was written down as expected; a third has **94**, and that save checksums, replays byte for byte, and decodes identically after a total cipher-state shift — which is the width proof, not the checksum. The game sizes the bar to the UI layout. The slot loop is self-terminating (it stops on the trailing eight bytes), which is why the wrong constant was invisible rather than fatal. `uiSettings` keeps the whole block so it can be written back; a hot slot is `kind` (`-1` empty, `0` a skill, `2`/`3` potions) and only kind 0 carries a payload. A kind-0 slot with an **empty** record string is normal — every character here has at least one.
+- **A mastery is not a field in the save**, and removing one is three edits: the header's class tag, block 2's unspent skill points, and block 8's entries. Membership is decided by **record path** (`records/skills/playerclassNN/`) rather than by a DB lookup. The class tag is `tagSkillClassName` + the remaining class numbers ascending — ten masteries exist on 1.3 (`playerclass01`–`10`) with all 45 combinations. `masteriesAllowed` is deliberately left alone so a replacement can be picked in game. **A mod's mastery does not match** (`playerclassmonk` has no digits), so a Custom Game character reports zero masteries even when its class tag says otherwise.
+- **A faction booster is a field in the save, not an item to own.** `FactionRep.positiveBoost`/`negativeBoost` are what the game's Writ (×1.5), Mandate (×3) and Warrant (×3, hostile) leave behind when consumed. The multipliers come from `db.factionBoosters()` — **the largest per faction per direction, never a hardcoded 3**, because a Mandate replaces rather than adds. Faction slot order is **not** in the game data; it was derived from live saves and is pinned in `src/save/factions.ts` (eight non-`User` factions at slots 0–7, `factionUser<N>` at slot N + 6). Don't re-guess it.
+- `transfer.gst` item X/Y are **floats**; `player.gdc` inventory/stash X/Y are **i32**. The classic porting bug.
+- **`reagents.gst`/`potions.gst` are `transfer.gst`'s format with entries wrapped in nested blocks.** Magic `1` (not `2`); identity is the block id (19 transmutes, 20 reagents, 21 potions). Two non-advancing reads per entry is why a uniform "every byte advances" walk desynchronizes progressively. **The store keeps rows at quantity 0** — a "has held this before" marker, not stock. This store is where loose components actually live.
+- **Characters live in two trees.** `save/main/<char>` is the campaign; `save/user/<char>` is what Custom Game writes. Independent namespaces, and **a name can exist in both** (this machine has a `_Suchka` and a `_Bitch` in each), so `characterSavePath`/`listCharacters` take a `SaveTree` defaulting to `main`. `findSaveDirs` keys on `main/`: the campaign tree is a save directory's identity.
+- The game writes saves event-driven and non-atomically: on checksum failure, retry (torn write), then fall back to `player.g00` rotation backups.
+- **`write.ts` keeps the original forever.** `backupCharacterSave` takes the calling app's `backupsDir` — this library does not guess where an app's data lives. Backups go *not* beside `player.gdc`, where the game keeps its own rotation and the watcher classifies by filename. The write is a temp file in the target directory plus `rename`, with an `fsync`, because a torn write here would be read as a torn save and fall back to a rotation backup — showing the character as they were *before* the edit.
+
+## The game database
+
+- **Item identity comes from the game's own `database/*.arz`**, merged base → gdx1 → gdx2 → gdx3 last-wins. GrimTools publishes no DBR record paths (verified) and its `bitmap` field is many-to-one. Do not re-add `itemdb.js`.
+- **Icons come from the game too.** `DbItem.iconPath` is the DBR `bitmap` field — an in-archive `.tex` path. Its first segment names the `.arc`, the rest is the entry; search gdx3 → gdx2 → gdx1 → base. A `.tex` is a 12-byte `TEX\x02` wrapper around a DDS whose magic reads `DDSR`; item icons are always uncompressed **BGRA** (never DXT), rows top-down.
+- **Names come from `resources/Text_<LOCALE>.arc`** — plain `key=value`, UTF-8, CRLF, `#` comments, BOM on the base archive's first file; merged in the same order as the `.arz`. 13 locales ship; the cache is keyed per language, icons shared across them.
+- Game version comes from a NUL-terminated `v1.3.0.6` string in `Engine.dll`.
+- **Inventory footprints are in the icon, and nowhere else** — no DBR field carries an item's cell size; the engine derives it from the texture at **32 px per cell**.
+- **Pet skill subtrees (`records/skills/*/pets/`) are excluded** — they are four fifths of the skill data and take `db.json` from 21 MB to 66 MB.
+- **`WANTED_PREFIXES` in `db/build.ts` is load-bearing**: a record not matching it is not in the parsed map at all. `records/creatures/pc/malepc01.dbr` must stay or base speeds silently fall back to defaults — and note `femalepc01.dbr` is *not* in the list, so anything needing it must pass its own filter to `readArz`.
+- **The cache is keyed by an archive fingerprint, not a version string** — a game patch rewrites the archives and rotates the key on its own. `defaultCacheRoot()` is shared between the apps (`~/Library/Application Support/grimdawn-core/cache`) because the cache belongs to the install, not to whoever read it; `GD_CACHE_DIR` moves it, and `GD_DATA_DIR` moves an app's data dir *and* nests the cache inside it, which is how tests isolate a whole run.
+
+## Tests
+
+`npm test` (vitest). **The fixtures are the user's real saves**, read in place — nothing game-derived is ever committed (`.gitignore` covers it; keep it that way). Tests needing byte stability snapshot-copy into git-ignored `test/fixtures/` on first use.
+
+**The character roster is discovered, not listed** (`CHARACTERS` in `test/paths.ts`). It used to be `['_Suchka', '_abcdef']`; `_abcdef` was deleted in game, `haveSaves()` went false, and **forty-one live tests skipped silently** — a skip being exactly what a machine without the game is supposed to report. Tests that need a character with a particular *shape* look for one (`characterWith`, `findResetMastery`) and say so when the machine has none. Never hardcode a character name or a build's numbers: these saves are played between runs.
+
+Verification:
+
+```bash
+npm test          # vitest
+npm run typecheck # tsc --noEmit
+```
+
+Point `GD_SAVE_DIR` / `GD_GAME_DIR` at a save tree and an install to run the live tests elsewhere.
+
+## Credits
+
+Game data is © Crate Entertainment. Ship code, not data.

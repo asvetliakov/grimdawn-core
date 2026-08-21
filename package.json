@@ -1,0 +1,23 @@
+{
+  "name": "@grimdawn/core",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Grim Dawn save parsing and writing, the game database, and icon extraction — shared by the AI Companion and the Patcher.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./db": "./src/db/index.ts",
+    "./icons": "./src/icons/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

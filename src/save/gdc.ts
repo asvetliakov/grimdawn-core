@@ -325,7 +325,15 @@ export function encodeBlock8(save: CharacterSave, version: number): Seg[] {
   return w.segments();
 }
 
-function isDevotionRecord(record: string): boolean {
+/**
+ * Devotion membership, decided by record path.
+ *
+ * Exported because block 8 interleaves devotions with skills and `save.devotions`
+ * is a *view* built by exactly this test — anything editing that array (a respec,
+ * say) has to partition it the same way or it will write back a different file
+ * than the one it reasoned about.
+ */
+export function isDevotionRecord(record: string): boolean {
   return /\/devotion\//i.test(record) || /skills\/devotion/i.test(record);
 }
 
@@ -491,6 +499,44 @@ function readBlock14(r: GdReader, s: ParseState, block: BlockStart): void {
     trailingWord,
     cameraDistance,
   };
+}
+
+/**
+ * Block 14, written back — the mirror of `readBlock14`, and next to it for the
+ * reason every encoder here is: `spliceRegion` compares this against what the
+ * decoder actually read before it will allow an edit, so the two drifting apart
+ * has to be a refusal to write rather than a corrupt save, and they only stay
+ * together if they are edited together.
+ *
+ * The slot count is whatever the save had. There is no padding to a fixed
+ * length, because there is no fixed length — see `readBlock14`.
+ */
+export function encodeBlock14(save: CharacterSave, version: number): Seg[] {
+  const ui = save.uiSettings;
+  if (!ui) throw new Error('block 14: this save was parsed without ui settings');
+  const w = new SegWriter();
+  w.u32(version);
+  w.bool(ui.equipmentSelection);
+  w.i32(ui.selectedSkillWindow);
+  w.bool(ui.skillSettingValid);
+  for (const set of ui.skillSets) {
+    w.str(set.primary);
+    w.str(set.secondary);
+    w.bool(set.active);
+  }
+  for (const word of ui.unknownWords) w.u32(word);
+  for (const slot of ui.hotSlots) {
+    w.i32(slot.kind);
+    if (slot.kind !== 0) continue;
+    if (!slot.skill) throw new Error('block 14: a skill slot with no skill');
+    w.str(slot.skill.record);
+    w.bool(slot.skill.isItemSkill);
+    w.str(slot.skill.item);
+    w.i32(slot.skill.equipSlot);
+  }
+  w.u32(ui.trailingWord);
+  w.f32(ui.cameraDistance);
+  return w.segments();
 }
 
 /** Blocks 12 and 10 — a versioned list of record paths (lore notes, UI flags). */

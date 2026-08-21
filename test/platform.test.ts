@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 import { candidateGameDirs, findGameDirs } from '../src/db/gamefiles.js';
 import { findSaveDirs } from '../src/paths.js';
 import { documentRoots, steamRoots, windowsRoots } from '../src/platform.js';
-import { haveGameInstall, haveSaves, MISSING_GAME_MESSAGE, MISSING_SAVES_MESSAGE, SAVE_DIR } from './paths.js';
+import { haveGameInstall, haveLiveSaves, MISSING_GAME_MESSAGE, MISSING_SAVES_MESSAGE, SAVE_DIR } from './paths.js';
 
 describe('finding the game and its saves', () => {
   it('looks for GOG as well as Steam, on every platform', () => {
@@ -43,10 +43,10 @@ describe('finding the game and its saves', () => {
   });
   it.runIf(!haveGameInstall())(MISSING_GAME_MESSAGE, () => {});
 
-  it.runIf(haveSaves())('finds the save tree that is actually here', () => {
+  it.runIf(haveLiveSaves())('finds the save tree that is actually here', () => {
     // `GD_SAVE_DIR` overrides the search, so what is asserted is that the search
     // itself still reaches the real one.
     expect(findSaveDirs()).toContain(SAVE_DIR);
   });
-  it.runIf(!haveSaves())(MISSING_SAVES_MESSAGE, () => {});
+  it.runIf(!haveLiveSaves())(MISSING_SAVES_MESSAGE, () => {});
 });

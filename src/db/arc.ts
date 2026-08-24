@@ -49,6 +49,8 @@ export interface ArcEntry {
   decompressedSize: number;
   chunkCount: number;
   firstChunk: number;
+  /** Windows `FILETIME`, carried through so a rebuild can put it back. */
+  fileTime: bigint;
 }
 
 export class ArcArchive {
@@ -108,6 +110,7 @@ export class ArcArchive {
           decompressedSize: entries.readUInt32LE(p + 12),
           chunkCount: entries.readUInt32LE(p + 28),
           firstChunk: entries.readUInt32LE(p + 32),
+          fileTime: entries.readBigUInt64LE(p + 20),
         });
       }
       return archive;
@@ -169,6 +172,233 @@ export class ArcArchive {
     if (this.fd !== undefined) closeSync(this.fd);
     this.fd = undefined;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+/**
+ * The largest decompressed bytes any real chunk holds — 256 KB exactly, in
+ * every archive this install ships. Files bigger than that are split.
+ */
+const MAX_CHUNK = 262144;
+
+/**
+ * Where the first file's bytes start. The header needs 28, and every shipped
+ * archive begins its data at 2048; the gap is zeros. Nothing reads it — offsets
+ * are explicit — but matching the game's own layout costs one page.
+ */
+const DATA_START = 2048;
+
+/** The `storage` word every live entry in a shipped archive carries. */
+const STORAGE_CHUNKED = 3;
+
+export interface ArcFile {
+  /** In-archive path, stored as given; lookups are case-insensitive. */
+  name: string;
+  data: Buffer;
+  /** Windows `FILETIME`. Round-trip an `ArcEntry`'s to rebuild an archive exactly. */
+  fileTime?: bigint;
+}
+
+/**
+ * Adler-32, which is what an entry's `hash` word holds — checked against every
+ * entry of the game's `Text_EN.arc` and a mod's, over the *decompressed* bytes.
+ *
+ * Blocked at 5552 bytes, the largest run that cannot overflow the accumulator,
+ * so the modulo is not paid per byte on a multi-megabyte texture.
+ */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let at = 0; at < data.length; at += 5552) {
+    const end = Math.min(at + 5552, data.length);
+    for (let i = at; i < end; i++) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Build an `.arc` from files in memory.
+ *
+ * Every chunk is stored **verbatim** — its two sizes equal, which is the flag
+ * the reader and the game both take to mean "these bytes are the file". That is
+ * a real encoding rather than a loophole: the game's own archives are full of
+ * chunks written that way, 94 of them in `Items.arc` alone, for data its
+ * compressor could not shrink. Writing every chunk that way costs size and buys
+ * not having a compressor to get wrong — the same trade `compressLz4Literals`
+ * makes for `.arz`, and this library only ever writes text-sized archives.
+ *
+ * A duplicate name throws: the reader indexes case-insensitively and would keep
+ * whichever came last, so two entries with one name is a caller's mistake that
+ * would otherwise surface as a file mysteriously not being the one written.
+ */
+export function writeArc(files: readonly ArcFile[]): Buffer {
+  const seen = new Set<string>();
+  const blobs: Buffer[] = [];
+  const chunkTable: Buffer[] = [];
+  const stringTable: Buffer[] = [];
+  const entries: Buffer[] = [];
+
+  let cursor = DATA_START;
+  let chunkIndex = 0;
+  let nameOffset = 0;
+
+  for (const file of files) {
+    const key = file.name.toLowerCase();
+    if (seen.has(key)) throw new Error(`${file.name} is named twice in this archive`);
+    seen.add(key);
+
+    const firstChunk = chunkIndex;
+    const start = cursor;
+    let chunkCount = 0;
+    for (let at = 0; at < file.data.length; at += MAX_CHUNK) {
+      const part = file.data.subarray(at, Math.min(at + MAX_CHUNK, file.data.length));
+      const chunk = Buffer.alloc(CHUNK_SIZE);
+      chunk.writeUInt32LE(cursor, 0);
+      chunk.writeUInt32LE(part.length, 4); // stored verbatim: the two sizes agree
+      chunk.writeUInt32LE(part.length, 8);
+      chunkTable.push(chunk);
+      blobs.push(part);
+      cursor += part.length;
+      chunkIndex++;
+      chunkCount++;
+    }
+
+    const nameBytes = Buffer.from(file.name, 'latin1');
+    const entry = Buffer.alloc(ENTRY_SIZE);
+    entry.writeUInt32LE(STORAGE_CHUNKED, 0);
+    entry.writeUInt32LE(start, 4);
+    entry.writeUInt32LE(file.data.length, 8);
+    entry.writeUInt32LE(file.data.length, 12);
+    entry.writeUInt32LE(adler32(file.data), 16);
+    entry.writeBigUInt64LE(file.fileTime ?? 0n, 20);
+    entry.writeUInt32LE(chunkCount, 28);
+    entry.writeUInt32LE(firstChunk, 32);
+    entry.writeUInt32LE(nameBytes.length, 36);
+    entry.writeUInt32LE(nameOffset, 40);
+    entries.push(entry);
+
+    // Names sit NUL-separated; the length word excludes the terminator.
+    stringTable.push(nameBytes, Buffer.of(0));
+    nameOffset += nameBytes.length + 1;
+  }
+
+  const chunks = Buffer.concat(chunkTable);
+  const strings = Buffer.concat(stringTable);
+  const table = Buffer.concat(entries);
+  const tableOffset = cursor;
+
+  const header = Buffer.alloc(HEADER_SIZE);
+  header.write(ARC_MAGIC, 0, 'latin1');
+  header.writeUInt32LE(ARC_VERSION, 4);
+  header.writeUInt32LE(files.length, 8);
+  header.writeUInt32LE(chunkIndex, 12);
+  header.writeUInt32LE(chunks.length, 16);
+  header.writeUInt32LE(strings.length, 20);
+  header.writeUInt32LE(tableOffset, 24);
+
+  return Buffer.concat([
+    header,
+    Buffer.alloc(DATA_START - HEADER_SIZE),
+    ...blobs,
+    chunks,
+    strings,
+    table,
+  ]);
+}
+
+/**
+ * Drop entries from an archive, leaving every file it keeps exactly where it is.
+ *
+ * This is how a stale override is undone. A mod's `resources/*.arc` shadows the
+ * game's archive entry by entry, so removing an entry does not delete anything
+ * — it lets the game's own copy through again, which is the only way to retire
+ * a texture or a text file a mod forked years ago.
+ *
+ * The file's whole data region and its chunk table are carried over untouched,
+ * dead chunks and all. That is what keeps it cheap on a 270 MB `ui.arc`, and it
+ * is also what keeps it *correct*: an entry names its chunks by index, so
+ * compacting the chunk table would mean rewriting every surviving entry to
+ * follow it. Only the string table and the entry table are rebuilt.
+ *
+ * A name the archive does not have throws, rather than being counted as
+ * removed — a revert list that has drifted from the archive should say so.
+ */
+export function removeArcEntries(buf: Buffer, names: readonly string[]): Buffer {
+  if (buf.length < HEADER_SIZE) throw new Error(`not an .arc archive: ${buf.length} bytes is shorter than the header`);
+  const magic = buf.toString('latin1', 0, 4);
+  if (magic !== ARC_MAGIC) throw new Error(`not an .arc archive: magic ${JSON.stringify(magic)} != "ARC\\0"`);
+  const version = buf.readUInt32LE(4);
+  if (version !== ARC_VERSION) throw new Error(`unsupported .arc version ${version} (expected ${ARC_VERSION})`);
+
+  const entryCount = buf.readUInt32LE(8);
+  const chunkTableSize = buf.readUInt32LE(16);
+  const stringTableSize = buf.readUInt32LE(20);
+  const tableOffset = buf.readUInt32LE(24);
+
+  const expected = tableOffset + chunkTableSize + stringTableSize + entryCount * ENTRY_SIZE;
+  if (expected !== buf.length) {
+    throw new Error(`tables end at ${expected} but the archive is ${buf.length} bytes`);
+  }
+  if (!names.length) return Buffer.from(buf);
+
+  const stringBase = tableOffset + chunkTableSize;
+  const entryBase = stringBase + stringTableSize;
+  const drop = new Set(names.map((n) => n.toLowerCase()));
+  const removed = new Set<string>();
+
+  const kept: Buffer[] = [];
+  const stringTable: Buffer[] = [];
+  let nameOffset = 0;
+
+  for (let i = 0; i < entryCount; i++) {
+    const p = entryBase + i * ENTRY_SIZE;
+    const nameLength = buf.readUInt32LE(p + 36);
+    const nameAt = buf.readUInt32LE(p + 40);
+    const name = buf.toString('latin1', stringBase + nameAt, stringBase + nameAt + nameLength);
+
+    if (drop.has(name.toLowerCase())) {
+      removed.add(name.toLowerCase());
+      continue;
+    }
+
+    // The entry is carried over whole — offset, sizes, hash, chunk range — and
+    // only repointed at where its name landed in the rebuilt string table.
+    const entry = Buffer.from(buf.subarray(p, p + ENTRY_SIZE));
+    const nameBytes = Buffer.from(name, 'latin1');
+    entry.writeUInt32LE(nameBytes.length, 36);
+    entry.writeUInt32LE(nameOffset, 40);
+    kept.push(entry);
+    stringTable.push(nameBytes, Buffer.of(0));
+    nameOffset += nameBytes.length + 1;
+  }
+
+  const missing = [...drop].filter((n) => !removed.has(n));
+  if (missing.length) throw new Error(`not in this archive: ${missing.join(', ')}`);
+
+  const strings = Buffer.concat(stringTable);
+  const table = Buffer.concat(kept);
+
+  const header = Buffer.from(buf.subarray(0, HEADER_SIZE));
+  header.writeUInt32LE(kept.length, 8);
+  header.writeUInt32LE(strings.length, 20);
+  // Chunk count, chunk-table size and the table offset all stay: the data
+  // region and the chunk table are the parts this does not touch.
+
+  return Buffer.concat([
+    header,
+    buf.subarray(HEADER_SIZE, tableOffset), // padding, then every file's bytes
+    buf.subarray(tableOffset, tableOffset + chunkTableSize),
+    strings,
+    table,
+  ]);
 }
 
 /** `readSync` may return a short read; loop until the range is filled. */

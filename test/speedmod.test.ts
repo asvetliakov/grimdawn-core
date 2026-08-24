@@ -31,6 +31,7 @@ import {
   patchArzValues,
   readArz,
   readArzRaw,
+  replaceArzRecords,
   writeArz,
   type RawArzRecord,
 } from '../src/db/arz.js';
@@ -168,6 +169,147 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
     for (const rec of additions) expect(after.get(rec.record), rec.record).toEqual(rec);
 
     expect(() => appendArzRecords(grown, [additions[0]!])).toThrow(/already named/);
+  });
+
+  const ENGINE = 'records/game/gameengine.dbr';
+
+  /** One record out of an archive, losslessly. */
+  function raw(archive: Buffer, record: string): RawArzRecord {
+    return readArzRaw(archive, { filter: (r) => r === record }).get(record)!;
+  }
+
+  /** A copy of a record with one field's values replaced. */
+  function withValues(rec: RawArzRecord, key: string, values: (number | string)[]): RawArzRecord {
+    return {
+      ...rec,
+      fields: rec.fields.map((f) => (f.key.toLowerCase() === key.toLowerCase() ? { ...f, values } : f)),
+    };
+  }
+
+  it('replaces a record whole, and leaves every other record where it was', () => {
+    const archive = writeArz([...liveRecords().values(), bystander()]);
+    const before = readArz(archive);
+
+    const replaced = replaceArzRecords(archive, [withValues(raw(archive, ENGINE), 'playerRunSpeedCapMax', [675])]);
+    const after = readArz(replaced);
+
+    expect(after.size).toBe(before.size);
+    for (const [key, was] of before) {
+      if (key === ENGINE) continue;
+      expect(after.get(key), key).toEqual(was);
+    }
+    expect(after.get(ENGINE)!.fields['playerRunSpeedCapMax']).toBe(675);
+
+    // Appended, not rewritten: the data section is byte for byte where it was,
+    // the record count did not move, and the file grew by about one block.
+    const dataEnd = archive.readUInt32LE(4);
+    expect(replaced.subarray(24, dataEnd).equals(archive.subarray(24, dataEnd))).toBe(true);
+    expect(replaced.readUInt32LE(12)).toBe(archive.readUInt32LE(12));
+    expect(replaced.length - archive.length).toBeLessThan(archive.length);
+  });
+
+  it('takes strings the archive has never held, and keeps every index already written', () => {
+    const archive = writeArz([...liveRecords().values(), bystander()]);
+    const before = readArz(archive);
+    const path = 'records/creatures/pc/malepc01.dbr';
+    const source = raw(archive, path);
+
+    // A string value nothing in this archive mentions, on a field that already
+    // holds one — the case `patchArzValues` cannot write at all.
+    const stringField = source.fields.find((f) => f.type === 2 && f.values.length === 1)!;
+    const novel = 'records/creatures/pc/anm_malepc_ported_by_this_test.dbr';
+    const replaced = replaceArzRecords(archive, [withValues(source, stringField.key, [novel])]);
+    const after = readArz(replaced);
+
+    expect(after.get(path)!.fields[stringField.key]).toBe(novel);
+    expect(replaced.readUInt32LE(20)).toBeGreaterThan(archive.readUInt32LE(20));
+    // Appending to the string table left every index already written valid.
+    for (const [key, was] of before) {
+      if (key === path) continue;
+      expect(after.get(key), key).toEqual(was);
+    }
+  });
+
+  it('adds fields the record never had, with keys the archive never held', () => {
+    const archive = writeArz([...liveRecords().values()]);
+    const source = raw(archive, ENGINE);
+    const grown: RawArzRecord = {
+      ...source,
+      fields: [
+        ...source.fields,
+        { key: 'aFieldThisArchiveHasNeverHeardOf', type: 0, values: [7] },
+        { key: 'andAStringOne', type: 2, values: ['records/some/new/target.dbr'] },
+      ],
+    };
+
+    const back = raw(replaceArzRecords(archive, [grown]), ENGINE);
+    expect(back.fields.map((f) => f.key)).toEqual(grown.fields.map((f) => f.key));
+    expect(back.fields).toEqual(grown.fields);
+  });
+
+  it('changes a record’s template type, entry length and all', () => {
+    const archive = writeArz([...liveRecords().values(), bystander()]);
+    const source = raw(archive, ENGINE);
+    const count = readArz(archive).size;
+
+    // Shorter and longer than the original: a type lives inline in the record
+    // table, so either direction moves the string table.
+    for (const type of ['X', `${source.type}_MuchLongerThanItWas`]) {
+      const out = replaceArzRecords(archive, [{ ...source, type }]);
+      const back = readArzRaw(out, { filter: () => true });
+      expect(back.get(ENGINE)!.type, type).toBe(type);
+      expect(back.size, type).toBe(count);
+      expect(out.readUInt32LE(4) + out.readUInt32LE(8), type).toBe(out.readUInt32LE(16));
+      expect(out.readUInt32LE(16) + out.readUInt32LE(20), type).toBe(out.length - 16);
+    }
+  });
+
+  it('writes the fileTime it is given, and keeps the one it is not asked to change', () => {
+    const archive = writeArz([...liveRecords().values()]);
+    const source = raw(archive, ENGINE);
+
+    expect(raw(replaceArzRecords(archive, [source]), ENGINE).fileTime).toBe(source.fileTime);
+    expect(raw(replaceArzRecords(archive, [{ ...source, fileTime: 123456789n }]), ENGINE).fileTime).toBe(123456789n);
+  });
+
+  it('refuses a record it cannot replace rather than adding one', () => {
+    const archive = writeArz([...liveRecords().values()]);
+    const source = raw(archive, ENGINE);
+
+    expect(() => replaceArzRecords(archive, [{ ...source, record: 'records/nope.dbr' }])).toThrow(
+      /not in this archive/,
+    );
+    expect(() => replaceArzRecords(archive, [source, source])).toThrow(/twice/);
+    // Nothing to do is not an error, and does not disturb a byte.
+    expect(replaceArzRecords(archive, []).equals(archive)).toBe(true);
+  });
+
+  it('replaces a record inside a real installed mod, leaving the rest of it alone', () => {
+    const installed = listMods(gameDir);
+    const mod = installed.find((m) => readFileSync(m.archivePath).length < 40_000_000) ?? installed[0];
+    if (!mod) return;
+
+    const source = readFileSync(mod.archivePath);
+    const before = readArz(source);
+    const path = [...before.keys()][0];
+    if (!path) return;
+
+    // Replacing a record with itself: every record in the archive, the replaced
+    // one included, must read back exactly as it did.
+    const out = replaceArzRecords(source, [raw(source, path)]);
+    const after = readArz(out);
+
+    expect(after.size).toBe(before.size);
+    let differing = 0;
+    for (const [key, was] of before) {
+      if (JSON.stringify(after.get(key)) !== JSON.stringify(was)) differing++;
+    }
+    expect(differing).toBe(0);
+
+    const dataEnd = source.readUInt32LE(4);
+    expect(out.subarray(24, dataEnd).equals(source.subarray(24, dataEnd))).toBe(true);
+    // And nothing was written to the install.
+    expect(readFileSync(mod.archivePath).equals(source)).toBe(true);
   });
 
   it('refuses rather than writing when the archive it built disagrees with the reader', () => {

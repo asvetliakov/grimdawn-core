@@ -417,6 +417,70 @@ function encodeRawFields(rec: RawArzRecord, intern: (s: string) => number): Buff
 }
 
 /**
+ * One record-table entry.
+ *
+ * The type string is stored *inline* rather than as a string-table index, which
+ * is why an entry is variable-length and why a writer that changes a record's
+ * type cannot patch the table in place.
+ */
+function encodeRecordEntry(
+  nameIndex: number,
+  type: string,
+  offset: number,
+  compressed: number,
+  raw: number,
+  fileTime: bigint,
+): Buffer {
+  const typeBytes = Buffer.from(type, 'latin1');
+  const out = Buffer.alloc(4 + 4 + typeBytes.length + 4 + 4 + 4 + 8);
+  let o = 0;
+  out.writeUInt32LE(nameIndex, o); o += 4;
+  out.writeUInt32LE(typeBytes.length, o); o += 4;
+  typeBytes.copy(out, o); o += typeBytes.length;
+  out.writeUInt32LE(offset, o); o += 4;
+  out.writeUInt32LE(compressed, o); o += 4;
+  out.writeUInt32LE(raw, o); o += 4;
+  out.writeBigUInt64LE(fileTime, o);
+  return out;
+}
+
+/**
+ * An interner over an archive's existing string table.
+ *
+ * A string already in the table keeps its index and anything new lands past the
+ * end, which is what lets a writer append to the table without rewriting a
+ * single record that points into it.
+ */
+function internerFor(strings: readonly string[]): { intern: (s: string) => number; added: string[] } {
+  const index = new Map<string, number>();
+  strings.forEach((s, i) => {
+    if (!index.has(s)) index.set(s, i);
+  });
+  const added: string[] = [];
+  const intern = (s: string): number => {
+    const seen = index.get(s);
+    if (seen !== undefined) return seen;
+    const at = strings.length + added.length;
+    index.set(s, at);
+    added.push(s);
+    return at;
+  };
+  return { intern, added };
+}
+
+/** The `u32 len` + bytes pairs for strings appended to an existing table. */
+function encodeStringTail(added: readonly string[]): Buffer {
+  const parts: Buffer[] = [];
+  for (const s of added) {
+    const bytes = Buffer.from(s, 'latin1');
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(bytes.length, 0);
+    parts.push(len, bytes);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
  * Add records an archive does not have, leaving what it does have untouched.
  *
  * The companion to `patchArzValues`, for the same job from the other side: a
@@ -447,21 +511,8 @@ export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]):
   const stringTableSize = buf.readUInt32LE(20);
 
   const strings = readStringTable(buf, stringTableStart);
-  const index = new Map<string, number>();
-  strings.forEach((s, i) => {
-    if (!index.has(s)) index.set(s, i);
-  });
-
+  const { intern, added } = internerFor(strings);
   const have = new Set(strings.map((s) => s.toLowerCase()));
-  const added: string[] = [];
-  const intern = (s: string): number => {
-    const seen = index.get(s);
-    if (seen !== undefined) return seen;
-    const at = strings.length + added.length;
-    index.set(s, at);
-    added.push(s);
-    return at;
-  };
 
   const blocks: Buffer[] = [];
   const entries: Buffer[] = [];
@@ -478,30 +529,14 @@ export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]):
     const raw = encodeRawFields(rec, intern);
     const block = compressLz4Literals(raw);
 
-    const typeBytes = Buffer.from(rec.type, 'latin1');
-    const entry = Buffer.alloc(4 + 4 + typeBytes.length + 4 + 4 + 4 + 8);
-    let o = 0;
-    entry.writeUInt32LE(nameIndex, o); o += 4;
-    entry.writeUInt32LE(typeBytes.length, o); o += 4;
-    typeBytes.copy(entry, o); o += typeBytes.length;
-    entry.writeUInt32LE(dataSize + appendedSize, o); o += 4;
-    entry.writeUInt32LE(block.length, o); o += 4;
-    entry.writeUInt32LE(raw.length, o); o += 4;
-    entry.writeBigUInt64LE(rec.fileTime, o);
-
     blocks.push(block);
-    entries.push(entry);
+    entries.push(
+      encodeRecordEntry(nameIndex, rec.type, dataSize + appendedSize, block.length, raw.length, rec.fileTime),
+    );
     appendedSize += block.length;
   }
 
-  const newStrings: Buffer[] = [];
-  for (const s of added) {
-    const bytes = Buffer.from(s, 'latin1');
-    const len = Buffer.alloc(4);
-    len.writeUInt32LE(bytes.length, 0);
-    newStrings.push(len, bytes);
-  }
-  const stringTail = Buffer.concat(newStrings);
+  const stringTail = encodeStringTail(added);
   const newEntries = Buffer.concat(entries);
 
   // The count leads the string table; the rest of it is carried over verbatim.
@@ -521,6 +556,127 @@ export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]):
     ...blocks,
     buf.subarray(recordTableStart, recordTableStart + recordTableSize),
     newEntries,
+    stringCount,
+    buf.subarray(stringTableStart + 4, stringTableStart + stringTableSize),
+    stringTail,
+    buf.subarray(stringTableStart + stringTableSize), // the sixteen trailing bytes
+  ]);
+}
+
+/**
+ * Replace whole records in an archive that already has them, leaving every
+ * other record's bytes where they are.
+ *
+ * `patchArzValues` can only overwrite numbers in place, and `appendArzRecords`
+ * refuses a name the archive already knows — which leaves the case porting a
+ * mod needs most: a record that is *there* and stale. A field pointing at a
+ * record that moved, a field set that predates an expansion, a whole new field
+ * the old copy never had. Rebuilding the archive is not an option at mod size,
+ * for the reasons `patchArzValues` sets out.
+ *
+ * So: the same surgery, one level up. The replacement's field stream is encoded
+ * fresh and its block **appended** after the existing data section, and only
+ * that record's table entry is rewritten to point at it; the old block stays
+ * behind as dead bytes. Two things differ from a value patch, and both fall out
+ * of replacing a record wholesale rather than editing inside it:
+ *
+ *   - A replacement may name strings the archive has never held — a new field
+ *     key, a new string value. Those are **appended** to the string table,
+ *     which is safe for the same reason it is in `appendArzRecords`: indices
+ *     are ordinal and the table is last but for the trailer, so every index
+ *     already written stays valid.
+ *   - A record's type is stored *inline* in its table entry, so a replacement
+ *     that changes it changes that entry's length. The table therefore cannot
+ *     be copied and poked the way `patchArzValues` copies it — it is re-emitted
+ *     entry by entry, untouched entries as verbatim slices, and the header
+ *     absorbs the difference.
+ *
+ * The record keeps its existing name index, so the archive's spelling of the
+ * path wins over the argument's. Record count and record order do not change.
+ * A record the archive does not have throws rather than being appended: the
+ * caller asked to replace something, and quietly creating it instead would turn
+ * a typo into a record nothing references.
+ */
+export function replaceArzRecords(buf: Buffer, records: readonly RawArzRecord[]): Buffer {
+  if (buf.length < 24) throw new Error(`not an .arz archive: ${buf.length} bytes is shorter than the header`);
+  const magic = buf.readUInt16LE(0);
+  const version = buf.readUInt16LE(2);
+  if (magic !== ARZ_MAGIC) throw new Error(`not an .arz archive: magic ${magic} != ${ARZ_MAGIC}`);
+  if (version !== ARZ_VERSION) throw new Error(`unsupported .arz version ${version} (expected ${ARZ_VERSION})`);
+  if (!records.length) return Buffer.from(buf);
+
+  const recordTableStart = buf.readUInt32LE(4);
+  const recordCount = buf.readUInt32LE(12);
+  const stringTableStart = buf.readUInt32LE(16);
+  const stringTableSize = buf.readUInt32LE(20);
+
+  const strings = readStringTable(buf, stringTableStart);
+  const { intern, added } = internerFor(strings);
+
+  const wanted = new Map<string, RawArzRecord>();
+  for (const rec of records) {
+    const key = rec.record.toLowerCase();
+    // Two replacements of one record would strand the first one's block and
+    // leave the caller guessing which won.
+    if (wanted.has(key)) throw new Error(`${rec.record} is replaced twice in one call`);
+    wanted.set(key, rec);
+  }
+
+  const dataSize = recordTableStart - 24;
+  const blocks: Buffer[] = [];
+  const entries: Buffer[] = [];
+  let appendedSize = 0;
+  const done = new Set<string>();
+
+  let p = recordTableStart;
+  for (let i = 0; i < recordCount; i++) {
+    const entryStart = p;
+    const nameIndex = buf.readUInt32LE(p);
+    const typeLen = buf.readUInt32LE(p + 4);
+    const entryEnd = p + 8 + typeLen + 12 + 8;
+    p = entryEnd;
+
+    const record = strings[nameIndex];
+    if (record === undefined) throw new Error(`record ${i}: name index ${nameIndex} is outside the string table`);
+    const rec = wanted.get(record.toLowerCase());
+    if (!rec) {
+      entries.push(buf.subarray(entryStart, entryEnd));
+      continue;
+    }
+
+    const raw = encodeRawFields(rec, intern);
+    const block = compressLz4Literals(raw);
+    entries.push(
+      encodeRecordEntry(nameIndex, rec.type, dataSize + appendedSize, block.length, raw.length, rec.fileTime),
+    );
+    blocks.push(block);
+    appendedSize += block.length;
+    done.add(record.toLowerCase());
+  }
+
+  for (const [key, rec] of wanted) {
+    if (!done.has(key)) throw new Error(`${rec.record} is not in this archive`);
+  }
+
+  const newTable = Buffer.concat(entries);
+  const stringTail = encodeStringTail(added);
+  const newRecordTableStart = recordTableStart + appendedSize;
+
+  // The count leads the string table; the rest of it is carried over verbatim.
+  const stringCount = Buffer.alloc(4);
+  stringCount.writeUInt32LE(strings.length + added.length, 0);
+
+  const header = Buffer.from(buf.subarray(0, 24));
+  header.writeUInt32LE(newRecordTableStart, 4);
+  header.writeUInt32LE(newTable.length, 8);
+  header.writeUInt32LE(newRecordTableStart + newTable.length, 16);
+  header.writeUInt32LE(stringTableSize + stringTail.length, 20);
+
+  return Buffer.concat([
+    header,
+    buf.subarray(24, recordTableStart), // every existing block, byte for byte
+    ...blocks,
+    newTable,
     stringCount,
     buf.subarray(stringTableStart + 4, stringTableStart + stringTableSize),
     stringTail,
@@ -718,19 +874,7 @@ export function writeArz(records: readonly RawArzRecord[]): Buffer {
   }
 
   const recordTable = Buffer.concat(
-    entries.map((e) => {
-      const typeBytes = Buffer.from(e.type, 'latin1');
-      const out = Buffer.alloc(4 + 4 + typeBytes.length + 4 + 4 + 4 + 8);
-      let o = 0;
-      out.writeUInt32LE(e.nameIndex, o); o += 4;
-      out.writeUInt32LE(typeBytes.length, o); o += 4;
-      typeBytes.copy(out, o); o += typeBytes.length;
-      out.writeUInt32LE(e.offset, o); o += 4;
-      out.writeUInt32LE(e.compressed, o); o += 4;
-      out.writeUInt32LE(e.raw, o); o += 4;
-      out.writeBigUInt64LE(e.fileTime, o);
-      return out;
-    }),
+    entries.map((e) => encodeRecordEntry(e.nameIndex, e.type, e.offset, e.compressed, e.raw, e.fileTime)),
   );
 
   const stringParts: Buffer[] = [];

@@ -252,6 +252,10 @@ export function writeArc(files: readonly ArcFile[]): Buffer {
 
   for (const file of files) {
     const key = file.name.toLowerCase();
+    // An entry with no name cannot be looked up, so it is either a mistake or
+    // a tombstone somebody read back out of another archive. Neither belongs
+    // in a file this writes.
+    if (key === '') throw new Error('an archive entry must have a name');
     if (seen.has(key)) throw new Error(`${file.name} is named twice in this archive`);
     seen.add(key);
 

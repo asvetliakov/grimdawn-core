@@ -211,3 +211,12 @@ describe.skipIf(!haveGameInstall())(
     });
   },
 );
+
+describe('tombstones', () => {
+  it('refuses to write an entry with no name', () => {
+    // A nameless entry cannot be looked up. Real archives carry them as dead
+    // space with a declared size of zero; reading one back yields whatever
+    // bytes it points at, and writing that out makes dead space live.
+    expect(() => writeArc([{ name: '', data: Buffer.from('x') }])).toThrow(/must have a name/);
+  });
+});

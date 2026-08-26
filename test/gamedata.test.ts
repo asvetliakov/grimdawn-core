@@ -5,7 +5,7 @@
  * from its decoder must fail rather than produce a plausible wrong file. Here
  * that means a *round trip* — take real records out of the install, write an
  * archive, read it back with the ordinary reader, and require every field to
- * agree. `planSpeedMod` runs that check itself and refuses on a mismatch; these
+ * agree. `planGameData` runs that check itself and refuses on a mismatch; these
  * tests prove it would catch one, and that the values it means to change are
  * the only ones that move.
  *
@@ -37,7 +37,17 @@ import {
 } from '../src/db/arz.js';
 import { findGameDir, gameArchives } from '../src/db/gamefiles.js';
 import { listMods } from '../src/db/mods.js';
-import { BASE_MOD_ARCHIVE, planSpeedMod, SPEED_MOD_RECORDS, type SpeedModBaseline } from '../src/db/speedmod.js';
+import {
+  BASE_MOD_ARCHIVE,
+  CONTAINER_HIGHLIGHT_FX,
+  planGameData,
+  recordsForKnobs,
+  type GameDataBaseline,
+} from '../src/db/gamedata.js';
+import { sweepIndex } from '../src/db/sweepindex.js';
+
+/** The three records the two movement-speed knobs live on. */
+const SPEED_RECORDS = recordsForKnobs({ run: 0, cap: 0 });
 import { MISSING_GAME_MESSAGE, haveGameInstall } from './paths.js';
 
 describe('LZ4 literal-only blocks', () => {
@@ -57,7 +67,7 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
   if (!haveGameInstall()) it.skip(MISSING_GAME_MESSAGE, () => {});
 
   const gameDir = findGameDir()!;
-  const wanted = (r: string) => SPEED_MOD_RECORDS.includes(r);
+  const wanted = (r: string) => SPEED_RECORDS.includes(r);
 
   /** The three records as the game's own archives merge them, last wins. */
   function liveRecords(): Map<string, RawArzRecord> {
@@ -74,7 +84,7 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
     let picked: string | undefined;
     const found = readArzRaw(buf, {
       filter: (r) => {
-        if (picked === undefined && !SPEED_MOD_RECORDS.includes(r)) picked = r;
+        if (picked === undefined && !SPEED_RECORDS.includes(r)) picked = r;
         return r === picked;
       },
     });
@@ -103,7 +113,7 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
 
   it('writes an archive the reader agrees with, field for field', () => {
     const source = [...liveRecords().values()];
-    expect(source.length).toBe(SPEED_MOD_RECORDS.length);
+    expect(source.length).toBe(SPEED_RECORDS.length);
 
     const archive = writeArz(source);
     const back = readArzRaw(archive, { filter: wanted });
@@ -122,7 +132,7 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
 
     // And the lossy reader — the one the rest of the library uses — reads it too.
     const cooked = readArz(archive, { filter: wanted });
-    expect(cooked.size).toBe(SPEED_MOD_RECORDS.length);
+    expect(cooked.size).toBe(SPEED_RECORDS.length);
   });
 
   it('patches one value in an existing archive and leaves every other record alone', () => {
@@ -168,7 +178,28 @@ describe.skipIf(!haveGameInstall())(`the .arz writer (${haveGameInstall() ? 'liv
     expect(after.get(other.record)).toEqual(other);
     for (const rec of additions) expect(after.get(rec.record), rec.record).toEqual(rec);
 
-    expect(() => appendArzRecords(grown, [additions[0]!])).toThrow(/already named/);
+    expect(() => appendArzRecords(grown, [additions[0]!])).toThrow(/already a record/);
+  });
+
+  it('appends a record whose name the archive already interns but does not define', () => {
+    // The case the campaign's own base mod is: something in it *points* at
+    // `playerlevels.dbr`, so the path is in the string table, while no record
+    // defines it. Guarding on the strings refused exactly the append the speed
+    // and cap changes need.
+    const additions = [...liveRecords().values()];
+    const namer = bystander();
+    const referenced = additions[0]!.record;
+    namer.fields.push({ key: 'someRecordPointer', type: 2, values: [referenced] });
+
+    const archive = writeArz([namer]);
+    expect(readArzRaw(archive, { filter: (r) => r === referenced }).size).toBe(0);
+
+    const grown = appendArzRecords(archive, additions);
+    const after = readArzRaw(grown, { filter: () => true });
+    expect(after.size).toBe(1 + additions.length);
+    for (const rec of additions) expect(after.get(rec.record), rec.record).toEqual(rec);
+    // The name was already interned, so it is reused rather than added twice.
+    expect(after.get(namer.record)!.fields.find((f) => f.key === 'someRecordPointer')!.values).toEqual([referenced]);
   });
 
   const ENGINE = 'records/game/gameengine.dbr';
@@ -350,7 +381,7 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
     let picked: string | undefined;
     bystanderRecord = readArzRaw(buf, {
       filter: (r) => {
-        if (picked === undefined && !SPEED_MOD_RECORDS.includes(r)) picked = r;
+        if (picked === undefined && !SPEED_RECORDS.includes(r)) picked = r;
         return r === picked;
       },
     }).get(picked!)!;
@@ -359,7 +390,7 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
   it('creates the base mod when there is none, naming the archive /basemods loads', () => {
-    const plan = planSpeedMod({ gameDir: dir, runPercent: 35 });
+    const plan = planGameData({ gameDir: dir, knobs: { run: 35, cap: 35 } });
     expect(plan.refusals).toEqual([]);
     expect(plan.action).toBe('create');
     expect(plan.arzPath).toBe(basePath);
@@ -368,35 +399,223 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
     for (const change of plan.changes) expect(change.to).toBeCloseTo(change.from * 1.35, 4);
   });
 
+  const LEVELS = 'records/creatures/pc/playerlevels.dbr';
+
+  it('sets the level and devotion caps to the number asked for, not a percentage of it', () => {
+    const plan = planGameData({ gameDir: dir, knobs: { maxLevel: 150, maxDevotionPoints: 80 } });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.changes.map((c) => [c.knob, c.to])).toEqual([
+      ['maxLevel', 150],
+      ['maxDevotionPoints', 80],
+    ]);
+    // Both knobs live on the one record, and it is added exactly once carrying
+    // both — the case that used to append it twice and lose the first change.
+    expect(plan.changes.map((c) => c.record)).toEqual([LEVELS, LEVELS]);
+
+    const back = readArzRaw(plan.output!, { filter: (r) => r === LEVELS });
+    expect(back.size).toBe(1);
+    const fields = back.get(LEVELS)!.fields;
+    expect(fields.find((f) => f.key === 'maxPlayerLevel')!.values).toEqual([150]);
+    expect(fields.find((f) => f.key === 'maxDevotionPoints')!.values).toEqual([80]);
+    // The rest of the record came along untouched, list fields included.
+    expect(fields.find((f) => f.key === 'skillModifierPoints')!.values.length).toBeGreaterThan(100);
+  });
+
+  it('reads only the records the knobs it was given live on', () => {
+    const speed = planGameData({ gameDir: dir, knobs: { run: 35, cap: 35 } });
+    expect(speed.refusals).toEqual([]);
+    expect(speed.changes.some((c) => c.record === LEVELS)).toBe(false);
+
+    const caps = planGameData({ gameDir: dir, knobs: { maxLevel: 150 } });
+    expect(caps.refusals).toEqual([]);
+    expect(caps.changes.every((c) => c.record === LEVELS)).toBe(true);
+    expect(caps.changes.length).toBe(1);
+  });
+
+  it('refuses a level cap past the last level the skill table has an entry for', () => {
+    const plan = planGameData({ gameDir: dir, knobs: { maxLevel: 4000 } });
+    const refusal = plan.refusals.find((r) => r.kind === 'level-above-skill-table');
+    expect(refusal).toBeDefined();
+    // The length is read out of the merged record rather than assumed here.
+    expect(refusal).toMatchObject({ value: 4000 });
+    expect((refusal as { entries: number }).entries).toBeGreaterThan(100);
+    expect(plan.output).toBeUndefined();
+  });
+
+  it('refuses when no knob was named at all, and says so differently', () => {
+    const plan = planGameData({ gameDir: dir, knobs: {} });
+    expect(plan.refusals).toEqual([{ kind: 'nothing-asked-for' }]);
+    expect(plan.output).toBeUndefined();
+  });
+
+  it('carries forward the marks it did not look at, so one knob cannot forget another', () => {
+    // The hazard this guards: applying a level cap on its own used to hand back
+    // a baseline holding only the level entries. Writing that would drop what
+    // the speed started at, and the next +35% would compound on this tool's own
+    // output.
+    const speed = planGameData({ gameDir: dir, knobs: { run: 35, cap: 35 } });
+    const afterSpeed = speed.baseline!;
+    expect(afterSpeed.length).toBe(3);
+
+    const level = planGameData({ gameDir: dir, knobs: { maxLevel: 150 }, baseline: afterSpeed });
+    expect(level.refusals).toEqual([]);
+    const kept = level.baseline!.filter((b) => b.field === 'characterRunSpeed' || b.field === 'playerRunSpeedCapMax');
+    expect(kept).toEqual(afterSpeed);
+    expect(level.baseline!.some((b) => b.field === 'maxPlayerLevel')).toBe(true);
+  });
+
+  it('has nothing to change when an absolute knob already holds the number asked for', () => {
+    const plan = planGameData({ gameDir: dir, knobs: { maxLevel: 150 } });
+    const first = readArzRaw(plan.output!, { filter: (r) => r === LEVELS }).get(LEVELS)!;
+    const held = first.fields.find((f) => f.key === 'maxPlayerLevel')!.values[0];
+    expect(held).toBe(150);
+
+    // Asking for the number the merged records already carry is idle, not a write.
+    const same = planGameData({ gameDir: dir, knobs: { maxLevel: 100 } });
+    expect(same.refusals).toEqual([{ kind: 'nothing-to-change' }]);
+    expect(same.untouched.map((u) => u.knob)).toEqual(['maxLevel']);
+  });
+
+  it('refuses a cap of zero rather than reading it as "leave it alone"', () => {
+    const plan = planGameData({ gameDir: dir, knobs: { maxDevotionPoints: 0 } });
+    expect(plan.refusals).toEqual([
+      { kind: 'value-out-of-range', knob: 'maxDevotionPoints', value: 0, min: 1, max: 9999 },
+    ]);
+  });
+
+  describe('sweeps — one value across every record a rule selects', () => {
+    // Built once: the scan is seconds, and every case here asks the same
+    // questions of it.
+    const index = () => sweepIndex(realGameDir);
+
+    it('describes what it would do without building the archive', () => {
+      const plan = planGameData({
+        gameDir: dir,
+        knobs: {},
+        sweeps: { pickupRadius: 2.7, ironPiles: 1 },
+        index: index(),
+        build: false,
+      });
+      expect(plan.refusals).toEqual([]);
+      // The window re-plans on every keystroke; making 54 MB of archive each
+      // time is what `build: false` exists to avoid.
+      expect(plan.output).toBeUndefined();
+      expect(plan.sweeps.map((s) => s.sweep).sort()).toEqual(['ironPiles', 'pickupRadius']);
+      const iron = plan.sweeps.find((s) => s.sweep === 'ironPiles')!;
+      expect(iron.changing + iron.already).toBe(18);
+    });
+
+    it('refuses a sweep it was given no index for, rather than scanning behind the caller', () => {
+      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { ironPiles: 1 } });
+      expect(plan.refusals).toEqual([{ kind: 'sweep-index-missing' }]);
+    });
+
+    it('sets both gold fields from the one knob, on exactly the records that have them', () => {
+      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { ironPiles: 1 }, index: index() });
+      expect(plan.refusals).toEqual([]);
+      const back = readArzRaw(plan.output!, { filter: () => true });
+      expect(back.size).toBe(18);
+      for (const [path, rec] of back) {
+        expect(rec.fields.find((f) => f.key === 'goldSplitMin')!.values, path).toEqual([1]);
+        expect(rec.fields.find((f) => f.key === 'goldSplitMax')!.values, path).toEqual([1]);
+      }
+    });
+
+    it('adds a field the record has never had, carrying every field it did have', () => {
+      // `patchArzValues` cannot do this — it overwrites in place — so this is
+      // the whole-record replace path, and the thing to check is that nothing
+      // else fell off the record on the way through.
+      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { highlightContainers: true }, index: index() });
+      expect(plan.refusals).toEqual([]);
+      const back = readArzRaw(plan.output!, { filter: () => true });
+      expect(back.size).toBeGreaterThan(100);
+      for (const [path, rec] of back) {
+        expect(rec.fields.find((f) => f.key === 'IdleEffect')!.values, path).toEqual([CONTAINER_HIGHLIGHT_FX]);
+        // A container carries far more than the one field it gained.
+        expect(rec.fields.length, path).toBeGreaterThan(5);
+        expect(rec.fields.find((f) => f.key === 'templateName'), path).toBeDefined();
+      }
+    });
+
+    it('leaves alone a record already at or above what a raising sweep asks for', () => {
+      // `markerRange` runs to 500 in the stock data, so setting everything to
+      // 250 would pull in a marker that is already visible from farther — the
+      // opposite of what asking for it means.
+      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { markerRange: 250 }, index: index(), build: false });
+      const marker = plan.sweeps.find((s) => s.sweep === 'markerRange')!;
+      expect(marker.already).toBeGreaterThan(0);
+      // At 1 almost everything is already above it; only the handful sitting at
+      // 0 rise to meet it, and nothing is pulled down to it.
+      const low = planGameData({ gameDir: dir, knobs: {}, sweeps: { markerRange: 1 }, index: index(), build: false });
+      const atOne = low.sweeps.find((s) => s.sweep === 'markerRange')!;
+      expect(atOne.already).toBeGreaterThan(marker.already);
+      expect(atOne.changing).toBeLessThan(marker.changing);
+    });
+
+    it('writes a sweep and a named knob into one archive, and keeps no baseline for the sweep', () => {
+      const plan = planGameData({
+        gameDir: dir,
+        knobs: { maxLevel: 120 },
+        sweeps: { ironPiles: 1 },
+        index: index(),
+      });
+      expect(plan.refusals).toEqual([]);
+      const back = readArzRaw(plan.output!, { filter: () => true });
+      expect(back.has('records/creatures/pc/playerlevels.dbr')).toBe(true);
+      expect(back.size).toBe(19);
+      // The knob is remembered so a percentage cannot compound; the sweep is
+      // absolute and idempotent, and ten thousand originals do not belong in a
+      // settings file. Putting a sweep back means restoring the archive.
+      expect(plan.baseline!.map((b) => b.field)).toEqual(['maxPlayerLevel']);
+    });
+
+    it('has nothing to change when the sweep is already applied', () => {
+      const first = planGameData({ gameDir: dir, knobs: {}, sweeps: { ironPiles: 1 }, index: index() });
+      const path = join(dir, 'mods', BASE_MOD_ARCHIVE);
+      writeFileSync(path, first.output!);
+      try {
+        const again = planGameData({ gameDir: dir, knobs: {}, sweeps: { ironPiles: 1 }, index: index(), build: false });
+        expect(again.refusals).toEqual([{ kind: 'nothing-to-change' }]);
+      } finally {
+        rmSync(path, { force: true });
+      }
+    });
+
+    it('refuses a value outside the range rather than writing it', () => {
+      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { pickupRadius: 500 }, index: index(), build: false });
+      expect(plan.refusals).toEqual([{ kind: 'sweep-out-of-range', sweep: 'pickupRadius', value: 500, min: 0.1, max: 20 }]);
+    });
+  });
+
   it('merges into one that already exists, keeping every record already in it', () => {
     // Somebody else's base mod: one unrelated record and none of ours.
     writeFileSync(basePath, writeArz([bystanderRecord]));
 
-    const plan = planSpeedMod({ gameDir: dir, runPercent: 35 });
+    const plan = planGameData({ gameDir: dir, knobs: { run: 35, cap: 35 } });
     expect(plan.refusals).toEqual([]);
     expect(plan.action).toBe('patch');
     expect(plan.changes.map((c) => c.how)).toEqual(['add', 'add', 'add']);
 
     const after = readArzRaw(plan.output!, { filter: () => true });
-    expect(after.size).toBe(1 + SPEED_MOD_RECORDS.length);
+    expect(after.size).toBe(1 + SPEED_RECORDS.length);
     expect(after.get(bystanderRecord.record)).toEqual(bystanderRecord);
   });
 
   it('overwrites its own records the second time, and does not compound the percentage', () => {
-    const first = planSpeedMod({ gameDir: dir, runPercent: 35 });
+    const first = planGameData({ gameDir: dir, knobs: { run: 35, cap: 35 } });
     writeFileSync(basePath, first.output!);
     const baseline = first.baseline!;
     const originals = new Map(baseline.map((b) => [`${b.record} ${b.field}`, b.original]));
 
     // Same percentage, same baseline: there is nothing left to do.
-    const again = planSpeedMod({ gameDir: dir, runPercent: 35, baseline });
+    const again = planGameData({ gameDir: dir, knobs: { run: 35, cap: 35 }, baseline });
     expect(again.output).toBeUndefined();
     expect(again.refusals).toEqual([{ kind: 'nothing-to-change' }]);
     expect(again.untouched).toHaveLength(3);
     expect(again.drifted).toBe(false);
 
     // A different percentage measures from the original, not from what is there.
-    const more = planSpeedMod({ gameDir: dir, runPercent: 50, baseline });
+    const more = planGameData({ gameDir: dir, knobs: { run: 50, cap: 50 }, baseline });
     expect(more.refusals).toEqual([]);
     expect(more.changes.map((c) => c.how)).toEqual(['overwrite', 'overwrite', 'overwrite']);
     for (const change of more.changes) {
@@ -409,10 +628,10 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
   });
 
   it('puts a field back where it started at 0%', () => {
-    const first = planSpeedMod({ gameDir: dir, runPercent: 40 });
+    const first = planGameData({ gameDir: dir, knobs: { run: 40, cap: 40 } });
     writeFileSync(basePath, first.output!);
 
-    const back = planSpeedMod({ gameDir: dir, runPercent: 0, capPercent: 40, baseline: first.baseline! });
+    const back = planGameData({ gameDir: dir, knobs: { run: 0, cap: 40 }, baseline: first.baseline! });
     expect(back.refusals).toEqual([]);
     const run = back.changes.filter((c) => c.field === 'characterRunSpeed');
     expect(run).toHaveLength(2);
@@ -422,12 +641,12 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
   });
 
   it('says so when the archive no longer holds what it wrote', () => {
-    const first = planSpeedMod({ gameDir: dir, runPercent: 25 });
+    const first = planGameData({ gameDir: dir, knobs: { run: 25, cap: 25 } });
     writeFileSync(basePath, first.output!);
 
     // The mod's author ships an update — or anything else edits the file.
-    const meddled: SpeedModBaseline[] = first.baseline!.map((b) => ({ ...b, written: b.written + 7 }));
-    const plan = planSpeedMod({ gameDir: dir, runPercent: 25, baseline: meddled });
+    const meddled: GameDataBaseline[] = first.baseline!.map((b) => ({ ...b, written: b.written + 7 }));
+    const plan = planGameData({ gameDir: dir, knobs: { run: 25, cap: 25 }, baseline: meddled });
     expect(plan.drifted).toBe(true);
     // What is there now is the new original, rather than being quietly re-based.
     for (const change of plan.changes) expect(change.original).toBe(change.from);
@@ -435,20 +654,20 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
 
   it('refuses a percentage that would stop the character, and one that changes nothing', () => {
     for (const percent of [-100, -150, Number.NaN]) {
-      const plan = planSpeedMod({ gameDir: dir, runPercent: percent });
+      const plan = planGameData({ gameDir: dir, knobs: { run: percent, cap: percent } });
       expect(plan.output, String(percent)).toBeUndefined();
-      expect(plan.refusals.map((r) => r.kind)).toContain('percent-out-of-range');
+      expect(plan.refusals.map((r) => r.kind)).toContain('value-out-of-range');
     }
 
     rmSync(basePath, { force: true });
-    const nothing = planSpeedMod({ gameDir: dir, runPercent: 0, capPercent: 0 });
+    const nothing = planGameData({ gameDir: dir, knobs: { run: 0, cap: 0 } });
     expect(nothing.output).toBeUndefined();
     expect(nothing.refusals).toEqual([{ kind: 'nothing-to-change' }]);
     expect(nothing.untouched).toHaveLength(3);
   });
 
   it('refuses a mod that is not installed, and says what is', () => {
-    const plan = planSpeedMod({ gameDir: dir, target: { kind: 'mod', mod: 'not-a-mod-on-this-machine' } });
+    const plan = planGameData({ gameDir: dir, knobs: { run: 35 }, target: { kind: 'mod', mod: 'not-a-mod-on-this-machine' } });
     expect(plan.output).toBeUndefined();
     expect(plan.refusals.map((r) => r.kind)).toEqual(['target-mod-missing']);
   });
@@ -465,7 +684,7 @@ describe.skipIf(!haveGameInstall())(`the speed change, into an installed mod (${
     if (!mod) return;
 
     const source = readFileSync(mod.archivePath);
-    const plan = planSpeedMod({ gameDir, target: { kind: 'mod', mod: mod.name }, runPercent: 35 });
+    const plan = planGameData({ gameDir, target: { kind: 'mod', mod: mod.name }, knobs: { run: 35, cap: 35 } });
     expect(plan.refusals).toEqual([]);
     expect(plan.action).toBe('patch');
     expect(plan.arzPath).toBe(mod.archivePath);
@@ -493,7 +712,7 @@ describe.skipIf(!haveGameInstall())(`the speed change, into an installed mod (${
     if (!mod) return;
 
     const source = readFileSync(mod.archivePath);
-    const plan = planSpeedMod({ gameDir, target: { kind: 'mod', mod: mod.name }, runPercent: 35 });
+    const plan = planGameData({ gameDir, target: { kind: 'mod', mod: mod.name }, knobs: { run: 35, cap: 35 } });
     if (plan.refusals.length) return;
 
     const before = readArz(source);

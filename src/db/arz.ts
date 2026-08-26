@@ -124,6 +124,19 @@ export interface ReadArzOptions {
   /** Keep only records whose path passes this test. Everything else is skipped
    *  without being decompressed, which is most of the file. */
   filter?: (record: string) => boolean;
+  /**
+   * Keep only these fields on each record it does read. **`readArzRaw` only.**
+   *
+   * The stream is still walked in full — the field lengths are what say where
+   * the next one starts — so this saves no reading. What it saves is *objects*:
+   * a record carries a couple of hundred fields, and a caller sweeping the whole
+   * database for four of them was building fifty times more than it kept. Left
+   * out, every field is kept, which is what a writer needs.
+   *
+   * Never pass this when the records are going to be written back: a record read
+   * this way is a partial one, and writing it would drop every field omitted.
+   */
+  fields?: ReadonlySet<string>;
 }
 
 /** Header magic; version 3 is what 1.3.x ships. */
@@ -326,12 +339,17 @@ export function readArzRaw(buf: Buffer, opts: ReadArzOptions = {}): Map<string, 
       buf.subarray(24 + dataOffset, 24 + dataOffset + compressedSize),
       decompressedSize,
     );
-    out.set(record, { record, type, fileTime, fields: readRawFields(data, strings, record) });
+    out.set(record, { record, type, fileTime, fields: readRawFields(data, strings, record, opts.fields) });
   }
   return out;
 }
 
-function readRawFields(data: Buffer, strings: string[], record: string): RawArzField[] {
+function readRawFields(
+  data: Buffer,
+  strings: string[],
+  record: string,
+  wanted?: ReadonlySet<string>,
+): RawArzField[] {
   const fields: RawArzField[] = [];
   let q = 0;
   while (q + 8 <= data.length) {
@@ -342,6 +360,13 @@ function readRawFields(data: Buffer, strings: string[], record: string): RawArzF
 
     const key = strings[keyIndex];
     if (key === undefined) throw new Error(`${record}: field key index ${keyIndex} is outside the string table`);
+
+    // Skipped by arithmetic rather than by reading: every value is four bytes,
+    // whatever its type, so an unwanted field costs one add.
+    if (wanted && !wanted.has(key)) {
+      q += count * 4;
+      continue;
+    }
 
     const values: (number | string)[] = [];
     for (let j = 0; j < count; j++) {
@@ -481,6 +506,63 @@ function encodeStringTail(added: readonly string[]): Buffer {
 }
 
 /**
+ * Every record name an archive defines, in table order.
+ *
+ * Reads the record table only — no block is decompressed — so this is the cheap
+ * way to ask "what is in here" before deciding what to pay for. `readArzRaw`'s
+ * filter sees the same names, which is what lets a caller select by path and
+ * skip the rest.
+ */
+export function arzRecordNames(buf: Buffer): string[] {
+  if (buf.length < 24) throw new Error(`not an .arz archive: ${buf.length} bytes is shorter than the header`);
+  if (buf.readUInt16LE(0) !== ARZ_MAGIC) throw new Error(`not an .arz archive: magic ${buf.readUInt16LE(0)}`);
+  const recordTableStart = buf.readUInt32LE(4);
+  const recordTableSize = buf.readUInt32LE(8);
+  const recordCount = buf.readUInt32LE(12);
+  const strings = readStringTable(buf, buf.readUInt32LE(16));
+  const table = buf.subarray(recordTableStart, recordTableStart + recordTableSize);
+  const names: string[] = [];
+  let p = 0;
+  for (let i = 0; i < recordCount; i++) {
+    const nameIndex = table.readUInt32LE(p);
+    const typeLen = table.readUInt32LE(p + 4);
+    p = p + 8 + typeLen + 12 + 8;
+    const record = strings[nameIndex];
+    if (record === undefined) throw new Error(`record ${i}: name index ${nameIndex} is outside the string table`);
+    names.push(record);
+  }
+  return names;
+}
+
+/**
+ * The names the record table actually defines, lowercased.
+ *
+ * Walks the entries for their name index alone — no block is decompressed — so
+ * this costs a pass over a few hundred kilobytes of table on an archive whose
+ * data section is tens of megabytes.
+ */
+function recordNamesIn(
+  buf: Buffer,
+  strings: readonly string[],
+  recordTableStart: number,
+  recordTableSize: number,
+  recordCount: number,
+): Set<string> {
+  const table = buf.subarray(recordTableStart, recordTableStart + recordTableSize);
+  const names = new Set<string>();
+  let p = 0;
+  for (let i = 0; i < recordCount; i++) {
+    const nameIndex = table.readUInt32LE(p);
+    const typeLen = table.readUInt32LE(p + 4);
+    p = p + 8 + typeLen + 12 + 8;
+    const record = strings[nameIndex];
+    if (record === undefined) throw new Error(`record ${i}: name index ${nameIndex} is outside the string table`);
+    names.add(record.toLowerCase());
+  }
+  return names;
+}
+
+/**
  * Add records an archive does not have, leaving what it does have untouched.
  *
  * The companion to `patchArzValues`, for the same job from the other side: a
@@ -496,7 +578,11 @@ function encodeStringTail(added: readonly string[]): Buffer {
  *
  * Adding a record the archive already has would leave two entries with the same
  * name and the reader would keep the last; that is the caller's mistake to
- * avoid, so it throws.
+ * avoid, so it throws. What counts as "already has" is the **record table**, not
+ * the string table: a name is interned the moment any record so much as points
+ * at it, and a base mod that references `playerlevels.dbr` without defining it
+ * is the ordinary case rather than the odd one. Testing the strings refused
+ * exactly the append this function exists for.
  */
 export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]): Buffer {
   if (buf.length < 24) throw new Error(`not an .arz archive: ${buf.length} bytes is shorter than the header`);
@@ -512,7 +598,7 @@ export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]):
 
   const strings = readStringTable(buf, stringTableStart);
   const { intern, added } = internerFor(strings);
-  const have = new Set(strings.map((s) => s.toLowerCase()));
+  const have = recordNamesIn(buf, strings, recordTableStart, recordTableSize, recordCount);
 
   const blocks: Buffer[] = [];
   const entries: Buffer[] = [];
@@ -521,9 +607,7 @@ export function appendArzRecords(buf: Buffer, records: readonly RawArzRecord[]):
 
   for (const rec of records) {
     if (have.has(rec.record.toLowerCase())) {
-      // A name in the table is not proof it is a record — but it is proof this
-      // is not the clean append this function promises.
-      throw new Error(`${rec.record} is already named in this archive`);
+      throw new Error(`${rec.record} is already a record in this archive`);
     }
     const nameIndex = intern(rec.record);
     const raw = encodeRawFields(rec, intern);

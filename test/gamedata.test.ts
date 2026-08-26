@@ -492,7 +492,7 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
       const plan = planGameData({
         gameDir: dir,
         knobs: {},
-        sweeps: { pickupRadius: 2.7, ironPiles: 1 },
+        sweeps: { markerRange: 250, ironPiles: 1 },
         index: index(),
         build: false,
       });
@@ -500,7 +500,7 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
       // The window re-plans on every keystroke; making 54 MB of archive each
       // time is what `build: false` exists to avoid.
       expect(plan.output).toBeUndefined();
-      expect(plan.sweeps.map((s) => s.sweep).sort()).toEqual(['ironPiles', 'pickupRadius']);
+      expect(plan.sweeps.map((s) => s.sweep).sort()).toEqual(['ironPiles', 'markerRange']);
       const iron = plan.sweeps.find((s) => s.sweep === 'ironPiles')!;
       expect(iron.changing + iron.already).toBe(18);
     });
@@ -582,8 +582,10 @@ describe.skipIf(!haveGameInstall())(`the speed change, into a base mod (${haveGa
     });
 
     it('refuses a value outside the range rather than writing it', () => {
-      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { pickupRadius: 500 }, index: index(), build: false });
-      expect(plan.refusals).toEqual([{ kind: 'sweep-out-of-range', sweep: 'pickupRadius', value: 500, min: 0.1, max: 20 }]);
+      const plan = planGameData({ gameDir: dir, knobs: {}, sweeps: { markerRange: 99_999 }, index: index(), build: false });
+      expect(plan.refusals).toEqual([
+        { kind: 'sweep-out-of-range', sweep: 'markerRange', value: 99_999, min: 1, max: 5000 },
+      ]);
     });
   });
 

@@ -3,10 +3,10 @@
  *
  * The four named knobs in `gamedata.ts` each edit a field on a handful of
  * records this code knows by name. A **sweep** is the other shape: one value
- * set on every record that matches a rule — the pickup radius on all ten
- * thousand item records, the marker range on everything that has one. The rules
- * are what the QoL base mods do, reimplemented so the change goes through this
- * app's plan-and-refuse path instead of arriving as somebody's 34 MB archive.
+ * set on every record that matches a rule — the marker range on everything that
+ * has one, the highlight on every container. The rules are what the QoL base
+ * mods do, reimplemented so the change goes through this app's plan-and-refuse
+ * path instead of arriving as somebody's 34 MB archive.
  *
  * **The rules cannot be answered cheaply, and that is the whole reason this
  * module exists.** `readArzRaw`'s filter is consulted per record-table entry and
@@ -17,7 +17,7 @@
  *
  * - decompressing all 81,017 records at once **exhausts the heap**;
  * - batched, keeping only `record → value`, it is about seven seconds;
- * - reading back just the ~11,850 that matched is under a second.
+ * - reading back just the ~1,800 that matched is well under a second.
  *
  * So the scan is batched so that nothing holds the whole database at once, and
  * its *answer* — paths and their current values, a few hundred kilobytes — is
@@ -34,9 +34,9 @@ import { buildCacheDir, ensureDir } from './cache.js';
 import { archivesFingerprint, gameArchives } from './gamefiles.js';
 
 /** The rules a sweep can select by. Each is a predicate over one merged record. */
-export type SweepRule = 'items-with-actorRadius' | 'has-markerRange' | 'has-goldSplit' | 'containers';
+export type SweepRule = 'has-markerRange' | 'has-goldSplit' | 'containers';
 
-export const SWEEP_RULES: SweepRule[] = ['items-with-actorRadius', 'has-markerRange', 'has-goldSplit', 'containers'];
+export const SWEEP_RULES: SweepRule[] = ['has-markerRange', 'has-goldSplit', 'containers'];
 
 /**
  * What one rule selected: every matching record, and what the merged game data
@@ -57,7 +57,6 @@ const CONTAINER_TEMPLATE = /fixeditemcontainer\.tpl$/i;
 
 /** Everything any rule looks at, and nothing else. */
 const SCANNED_FIELDS: ReadonlySet<string> = new Set([
-  'actorRadius',
   'markerRange',
   'goldSplitMax',
   'IdleEffect',
@@ -70,16 +69,13 @@ function field(rec: RawArzRecord, key: string): (number | string)[] | undefined 
 
 /** The field each rule reads, so the index can record what is there now. */
 const RULE_FIELD: Record<SweepRule, string> = {
-  'items-with-actorRadius': 'actorRadius',
   'has-markerRange': 'markerRange',
   'has-goldSplit': 'goldSplitMax',
   containers: 'IdleEffect',
 };
 
-function matches(rule: SweepRule, path: string, rec: RawArzRecord): boolean {
+function matches(rule: SweepRule, rec: RawArzRecord): boolean {
   switch (rule) {
-    case 'items-with-actorRadius':
-      return path.startsWith('records/items/') && field(rec, 'actorRadius') !== undefined;
     case 'has-markerRange':
       return field(rec, 'markerRange') !== undefined;
     case 'has-goldSplit':
@@ -139,7 +135,7 @@ export function scanSweeps(gameDir: string, onProgress?: (p: ScanProgress) => vo
     }
     for (const [path, rec] of merged) {
       for (const rule of SWEEP_RULES) {
-        if (!matches(rule, path, rec)) continue;
+        if (!matches(rule, rec)) continue;
         const value = field(rec, RULE_FIELD[rule])?.[0];
         rules[rule][path] = value === undefined ? null : value;
       }

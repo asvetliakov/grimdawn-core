@@ -133,11 +133,10 @@ export const CONTAINER_HIGHLIGHT_FX = 'records/fx/itemfx/chestloop01_fx.dbr';
  * The other shape of change: one value set on **every record matching a rule**,
  * rather than on records this file knows by name.
  *
- * These are the quality-of-life edits the base mods make — pick items up from
- * farther away, see quest markers sooner, take iron in one pile, light up every
- * container. Each is genuinely one constant across thousands of records, which
- * is why they are worth having without the mod that reverts a patch's content
- * along the way.
+ * These are the quality-of-life edits the base mods make — see quest markers
+ * sooner, take iron in one pile, light up every container. Each is genuinely one
+ * constant across many records, which is why they are worth having without the
+ * mod that reverts a patch's content along the way.
  *
  * Which records a rule selects cannot be known from a record's *name*, so it
  * costs a scan of the database — see `sweepindex.ts`, which does that once and
@@ -149,10 +148,9 @@ export const SWEEPS = {
    * across the game — it runs from 0 to 500 — so setting every record to 250
    * would pull in every marker already visible from farther than that, which is
    * the opposite of what asking for it means. A record already at or above the
-   * value is left alone instead. The pickup radius is the same promise, and iron
-   * is not: "one pile" is exactly one, and 1 is below every stock value.
+   * value is left alone instead. Iron is not raise-only: "one pile" is exactly
+   * one, and 1 is below every stock value.
    */
-  pickupRadius: { rule: 'items-with-actorRadius', fields: ['actorRadius'], adds: false, raiseOnly: true, min: 0.1, max: 20 },
   markerRange: { rule: 'has-markerRange', fields: ['markerRange'], adds: false, raiseOnly: true, min: 1, max: 5000 },
   ironPiles: { rule: 'has-goldSplit', fields: ['goldSplitMin', 'goldSplitMax'], adds: false, raiseOnly: false, min: 1, max: 50 },
   /** A string field the record does not have yet, which is why it is its own case. */
@@ -172,7 +170,6 @@ export const SWEEP_NAMES = Object.keys(SWEEPS) as SweepName[];
  * `true` rather than a number nobody would pick.
  */
 export type GameDataSweeps = Partial<{
-  pickupRadius: number;
   markerRange: number;
   ironPiles: number;
   highlightContainers: boolean;

@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { ChecksumError, GdReader } from '../src/save/cipher.js';
-import { GDC_MAGIC, parseGdc } from '../src/save/gdc.js';
+import { GDC_MAGIC, encodeBlock14, parseGdc, parseGdcRecording } from '../src/save/gdc.js';
 import { factionTier } from '../src/save/factions.js';
+import { replay } from '../src/save/transcript.js';
 import { GdWriter, synthBlock } from './gdwriter.js';
 import {
   CHARACTERS,
@@ -123,6 +124,62 @@ describe('block framing', () => {
     expect(next.id).toBe(5);
     expect(r.readU32()).toBe(0xbeef);
     expect(() => r.endBlock(next)).not.toThrow();
+  });
+});
+
+describe('block 14 hotbar', () => {
+  it('reads and records a placed consumable (kind 4)', () => {
+    const w = new GdWriter(0x14141414);
+    w.writeU32(GDC_MAGIC);
+    w.writeU32(1); // header version
+    w.writeWStr('Hotbar');
+    w.writeByte(0); // sex
+    w.writeStr(''); // class
+    w.writeI32(1); // level
+    w.writeBool(false); // hardcore
+    w.writeByte(0); // expansion status
+    w.writeChecksum();
+    w.writeU32(8); // data version
+    for (let i = 0; i < 16; i++) w.writeByte(0);
+
+    const block = w.beginBlock(14);
+    w.writeU32(7);
+    w.writeBool(false);
+    w.writeI32(0);
+    w.writeBool(false);
+    for (let i = 0; i < 5; i++) {
+      w.writeStr('');
+      w.writeStr('');
+      w.writeBool(false);
+    }
+    for (const word of [1, 47, 0]) w.writeU32(word);
+    w.writeI32(4);
+    w.writeStr('records/items/crafting/consumables/potion_royaljellyextract.dbr');
+    w.writeStr('items/craftingparts/consumable/consumablea_darkblueup.tex');
+    w.writeStr('items/craftingparts/consumable/consumablea_darkbluedown.tex');
+    w.writeWStr('{^r}Royal Jelly Extract');
+    w.writeU32(5);
+    w.writeFloat(12.5);
+    w.endBlock(block);
+    const source = w.toBuffer();
+
+    const { save, transcript } = parseGdcRecording(source);
+    expect(save.warnings).toEqual([]);
+    expect(save.blocks).toEqual([{ id: 14, length: 320, status: 'parsed', checksumOk: true }]);
+    expect(save.uiSettings?.hotSlots).toEqual([
+      {
+        kind: 4,
+        consumable: {
+          record: 'records/items/crafting/consumables/potion_royaljellyextract.dbr',
+          bitmapUp: 'items/craftingparts/consumable/consumablea_darkblueup.tex',
+          bitmapDown: 'items/craftingparts/consumable/consumablea_darkbluedown.tex',
+          name: '{^r}Royal Jelly Extract',
+        },
+      },
+    ]);
+    const recorded = transcript.segments.find((seg) => seg.kind === 'block' && seg.id === 14);
+    expect(recorded?.kind === 'block' ? recorded.body : undefined).toEqual(encodeBlock14(save, 7));
+    expect(replay(transcript).equals(source)).toBe(true);
   });
 });
 

@@ -6,11 +6,22 @@
  * Game character is playing", found by looking. What *is* asserted is the
  * property the patcher leans on — that the search distinguishes the mod which
  * defines a record from the ones that merely exist.
+ *
+ * A save outlives the mod that made it: `_Bitch` and `_Suchka` in the custom
+ * tree still name `playerclasstempest` and `playerclassmonk`, and Path of Grim
+ * Dawn — which defined both — is no longer installed here. That is an ordinary
+ * state of the machine, not a failure, so the subject is a character whose mod
+ * is *still on disk*; without one, the three tests that need a pairing skip.
+ * What must not skip with them is the mechanism, or a `modsDefiningRecords`
+ * that had stopped finding anything would look like a machine without the mod
+ * — so it is checked separately, against records read out of whichever mod is
+ * installed.
  */
 
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
+import { arzRecordNames } from '../src/db/arz.js';
 import { loadGameDb, loadNormalizedDb } from '../src/db/index.js';
 import { listMods, modArchive, modArchivePath, modsDefiningRecords, resolveModArchive } from '../src/db/mods.js';
 import { findGameDir } from '../src/db/gamefiles.js';
@@ -21,15 +32,21 @@ import { customCharacterSavePath, customCharacters, haveCustomSaves, haveGameIns
 const GAME_DIR = haveGameInstall() ? findGameDir()! : undefined;
 const MODS = GAME_DIR ? listMods(GAME_DIR) : [];
 
-/** A Custom Game character whose mastery the base game cannot name. */
-function modCharacter(): { character: string; bars: string[] } | undefined {
+/**
+ * A Custom Game character whose mastery the base game cannot name *and* an
+ * installed mod still defines. Both halves are required: the first is what
+ * makes the character interesting, the second is what makes the pairing
+ * assertable on this machine.
+ */
+function modCharacter(): { character: string; bars: string[]; mod: string } | undefined {
   if (!GAME_DIR || !haveCustomSaves()) return undefined;
   for (const character of customCharacters()) {
     const save = parseGdc(readFileSync(customCharacterSavePath(character)));
     const masteries = characterMasteries(save);
-    if (masteries.length && masteries.every((m) => m.classNumber === undefined)) {
-      return { character, bars: masteries.map((m) => m.record) };
-    }
+    if (!masteries.length || masteries.some((m) => m.classNumber !== undefined)) continue;
+    const bars = masteries.map((m) => m.record);
+    const [defining] = modsDefiningRecords(GAME_DIR, bars);
+    if (defining) return { character, bars, mod: defining.mod };
   }
   return undefined;
 }
@@ -72,6 +89,26 @@ describe.skipIf(!GAME_DIR)('installed mods', () => {
     expect(modsDefiningRecords(GAME_DIR!, ['records/skills/playerclassnosuchthing/_classtraining_x.dbr'])).toEqual([]);
   });
 
+  it('names the mod that defines records taken out of that mod', () => {
+    if (!MODS.length) return;
+    // The positive half of the search, asked without a Custom Game character in
+    // the picture: read record paths straight out of an installed mod's archive
+    // and require the search to attribute them to it. This is what keeps a
+    // broken `modsDefiningRecords` from reading as "the mod is not installed".
+    const mod = MODS[0]!;
+    const names = arzRecordNames(readFileSync(mod.archivePath));
+    expect(names.length).toBeGreaterThan(0);
+    const sample = [names[0]!, names[Math.floor(names.length / 2)]!, names.at(-1)!];
+
+    const found = modsDefiningRecords(GAME_DIR!, sample);
+    expect(found.map((f) => f.mod)).toContain(mod.name);
+    expect(found.find((f) => f.mod === mod.name)!.found).toHaveLength(sample.length);
+
+    // One record it has and one it cannot have is not a match: the search
+    // answers "holds every record asked for", which is what makes it an answer.
+    expect(modsDefiningRecords(GAME_DIR!, [sample[0]!, 'records/skills/playerclassnosuchthing/_x.dbr'])).toEqual([]);
+  });
+
   it.runIf(SUBJECT)('finds the mod that defines a Custom Game character’s mastery', () => {
     const found = modsDefiningRecords(GAME_DIR!, SUBJECT!.bars);
 
@@ -84,10 +121,7 @@ describe.skipIf(!GAME_DIR)('installed mods', () => {
   });
 
   it.runIf(SUBJECT)('and that mod’s database can name the class the save’s tag spells', async () => {
-    const [defining] = modsDefiningRecords(GAME_DIR!, SUBJECT!.bars);
-    if (!defining) return;
-
-    const db = await loadGameDb({ gameDir: GAME_DIR!, mod: defining.mod });
+    const db = await loadGameDb({ gameDir: GAME_DIR!, mod: SUBJECT!.mod });
     const save = parseGdc(readFileSync(customCharacterSavePath(SUBJECT!.character)));
 
     // The whole point: the numbers the mod declares, recomposed, are the class
@@ -102,15 +136,12 @@ describe.skipIf(!GAME_DIR)('installed mods', () => {
   }, 60_000);
 
   it.runIf(SUBJECT)('caches a mod-aware database beside the plain one, not over it', async () => {
-    const [defining] = modsDefiningRecords(GAME_DIR!, SUBJECT!.bars);
-    if (!defining) return;
-
-    const withMod = await loadNormalizedDb({ gameDir: GAME_DIR!, mod: defining.mod });
+    const withMod = await loadNormalizedDb({ gameDir: GAME_DIR!, mod: SUBJECT!.mod });
     const base = await loadNormalizedDb({ gameDir: GAME_DIR! });
     // The AI Companion shares this cache and asks only about the campaign; a
     // mod-aware build written under the plain fingerprint would answer it.
     expect(withMod.fingerprint).not.toBe(base.fingerprint);
-    expect(withMod.archives).toContain(defining.mod);
-    expect(base.archives).not.toContain(defining.mod);
+    expect(withMod.archives).toContain(SUBJECT!.mod);
+    expect(base.archives).not.toContain(SUBJECT!.mod);
   }, 60_000);
 });

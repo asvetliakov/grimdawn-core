@@ -310,6 +310,63 @@ describe.skipIf(!haveGameInstall())(`game database (${haveGameInstall() ? 'live'
     expect(named.filter((i) => /[()]/.test(i.name)).map((i) => i.name)).toEqual([]);
   });
 
+  it('indexes the items the game files outside records/items/', { timeout: BUILD_TIMEOUT }, async () => {
+    // Secret items are filed with the thing that gives them, not with the loot:
+    // Lokarr's Spoils is four wearable pieces and a set record under
+    // `records/storyelements/signs/`, Wilhelm's Wondrous Wargem is a GDX2 quest
+    // asset, and Leovinus' Ring and the Totally Normal Shield come from the
+    // Shattered Realm. Reading only `records/items/` left a save that carries one
+    // showing `unresolved record:` in red, with the set bonus gone — which is how
+    // this was reported. Every root in `ITEM_ROOTS` earns its place here.
+    const db = await gameDb();
+
+    const lokarr = [
+      ['records/storyelements/signs/signh.dbr', "Lokarr's Gaze", 'ArmorProtective_Head'],
+      ['records/storyelements/signs/signt.dbr', "Lokarr's Coat", 'ArmorProtective_Chest'],
+      ['records/storyelements/signs/signs.dbr', "Lokarr's Mantle", 'ArmorProtective_Shoulders'],
+      ['records/storyelements/signs/signf.dbr', "Lokarr's Boots", 'ArmorProtective_Feet'],
+    ] as const;
+    for (const [record, name, slot] of lokarr) {
+      const item = db.getItem(record);
+      expect(item?.name, record).toBe(name);
+      expect(item?.slot, record).toBe(slot);
+      // The set is what the report was really about: four pieces resolving
+      // individually with no set behind them is still a broken answer.
+      expect(item?.setName, record).toBe("Lokarr's Spoils");
+      expect(item?.setRecord, record).toBe('records/storyelements/signs/signset.dbr');
+    }
+
+    const set = db.getSet('records/storyelements/signs/signset.dbr');
+    expect(set?.members).toHaveLength(4);
+    expect(Object.keys(set?.bonuses ?? {}).length).toBeGreaterThan(0);
+
+    expect(db.getItem('records/storyelementsgdx2/questassets/areag_n.dbr')?.name).toBe(
+      "Wilhelm's Wondrous Wargem",
+    );
+    expect(db.getItem('records/endlessdungeon/items/a001_ring.dbr')?.name).toBe("Leovinus' Ring");
+    // Filed under `scriptentities`, and a mace by template — the joke is the point.
+    expect(db.getItem('records/endlessdungeon/scriptentities/portal_s01.dbr')?.name).toBe(
+      'Totally Normal Shield',
+    );
+
+    // Quest rewards live out there too, and a character carries them.
+    expect(db.getItem('records/storyelements/rewards/q003_ring_slithring.dbr')?.name).toBeTruthy();
+
+    // Each expansion adds its own storyelements tree beside the base one, which
+    // is why the root is a prefix rather than a list: this one was found by
+    // sweeping for what was *still* missing after the first three were named.
+    expect(db.getItem('records/storyelementsgdx3/questassets/patchednotes.dbr')?.name).toBe('Patched Notes');
+
+    // …and nothing obtainable is left outside. What remains is Crate's editor
+    // scratch (`records/sandbox`), NPC and monster gear (`records/creatures`)
+    // and weapon trails (`records/fx`) — none of which a save can reference.
+    const indexed = (db as unknown as { raw: { items: Record<string, DbItem> } }).raw.items;
+    const outside = Object.keys(indexed).filter(
+      (r) => !r.startsWith('records/items/') && !r.startsWith('records/storyelements') && !r.startsWith('records/endlessdungeon/'),
+    );
+    expect(outside).toEqual([]);
+  });
+
   it('reads the levelling rates out of the player-levels record', { timeout: BUILD_TIMEOUT }, async () => {
     // The unlock ladder turns a requirement deficit into "spend N points" with
     // these. The difficulty penalty taught the lesson: the game states them, so

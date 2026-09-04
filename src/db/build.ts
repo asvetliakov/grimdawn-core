@@ -31,7 +31,7 @@ import {
 } from './types.js';
 
 /** Bump when the shape below changes so stale caches rebuild instead of misreading. */
-export const DB_SCHEMA_VERSION = 14;
+export const DB_SCHEMA_VERSION = 15;
 
 export interface NormalizedDb {
   schemaVersion: number;
@@ -89,12 +89,41 @@ export interface NormalizedDb {
 }
 
 /**
+ * Where item records live. `records/items/` is where all but a handful are, and
+ * for a long time it was the only root read — which quietly lost every item the
+ * game hides outside it. Lokarr's Spoils is four wearable pieces and a set record
+ * under `records/storyelements/signs/`; Wilhelm's Wondrous Wargem is a quest
+ * asset in `records/storyelementsgdx2/`; Leovinus' Ring and the Totally Normal
+ * Shield are `records/endlessdungeon/`. They are secret items, so the game files
+ * them with the thing that gives them rather than with the loot — and a save
+ * referencing one came back `unresolved record:` in red, set bonus and all.
+ * Quest rewards live out there too (the Slith ring, the brothers' amulet).
+ *
+ * `records/storyelements` is deliberately unslashed: each expansion adds its own
+ * tree beside the base one — `storyelementsgdx2` holds the Wargem, `gdx3` holds
+ * Patched Notes — so a list of the trees that exist today is a list that the next
+ * expansion falsifies. Fixing this bug with one and then finding gdx3 by sweeping
+ * for what was still missing is the argument for the prefix.
+ *
+ * The extra trees are ~3.2k records against `records/items/`'s 26k, and only the
+ * item-classed ones are indexed, so this costs a little decompression and nothing
+ * else. Everything still outside is `records/sandbox` (Crate's editor scratch),
+ * `records/creatures` (NPC and monster gear) and `records/fx` (weapon trails) —
+ * none of it obtainable, and indexing sandbox would invent 64 blueprints.
+ */
+const ITEM_ROOTS = [
+  'records/items/',
+  'records/storyelements',
+  'records/endlessdungeon/',
+];
+
+/**
  * Only these subtrees are decompressed. The archives hold ~82k records; items,
- * skills, merchants and factions are the ~41k we have any use for, and skipping
+ * skills, merchants and factions are the ~44k we have any use for, and skipping
  * the rest is most of the parse time.
  */
 const WANTED_PREFIXES = [
-  'records/items/',
+  ...ITEM_ROOTS,
   'records/skills/',
   'records/creatures/npcs/merchants/',
   'records/controllers/factions/',
@@ -707,7 +736,7 @@ export function buildDb(input: BuildInput): NormalizedDb {
   let localizedNames = 0;
 
   for (const [path, rec] of records) {
-    if (!path.startsWith('records/items/')) continue;
+    if (!ITEM_ROOTS.some((root) => path.startsWith(root))) continue;
     const cls = str(rec, 'Class') ?? rec.type;
 
     for (const [key, value] of Object.entries(rec.fields)) {

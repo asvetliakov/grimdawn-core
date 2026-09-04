@@ -768,6 +768,74 @@ export function replaceArzRecords(buf: Buffer, records: readonly RawArzRecord[])
   ]);
 }
 
+/**
+ * Drop records from an archive, leaving every block and every string where it is.
+ *
+ * The inverse of `appendArzRecords`, and the only honest undo for one: a
+ * record this library added to somebody's mod has no "original" to put back,
+ * so retiring it means the game must stop seeing it at all. Only the record
+ * table is rebuilt — its entries are copied across verbatim minus the dropped
+ * ones — and the header's count, table size and string-table offset follow.
+ * The data blocks stay behind as dead bytes, which the game does not mind
+ * (`patchArzValues` has been leaving them for as long as it has existed), and
+ * the string table is untouched because a name interned there harms nothing:
+ * the game reads records through the table, not the strings.
+ *
+ * A name the archive does not define throws rather than counting as removed —
+ * an undo list that has drifted from the archive should say so, the same rule
+ * `removeArcEntries` follows.
+ */
+export function removeArzRecords(buf: Buffer, names: readonly string[]): Buffer {
+  if (buf.length < 24) throw new Error(`not an .arz archive: ${buf.length} bytes is shorter than the header`);
+  const magic = buf.readUInt16LE(0);
+  const version = buf.readUInt16LE(2);
+  if (magic !== ARZ_MAGIC) throw new Error(`not an .arz archive: magic ${magic} != ${ARZ_MAGIC}`);
+  if (version !== ARZ_VERSION) throw new Error(`unsupported .arz version ${version} (expected ${ARZ_VERSION})`);
+  if (!names.length) return Buffer.from(buf);
+
+  const recordTableStart = buf.readUInt32LE(4);
+  const recordCount = buf.readUInt32LE(12);
+  const stringTableStart = buf.readUInt32LE(16);
+  const strings = readStringTable(buf, stringTableStart);
+
+  const drop = new Set(names.map((n) => n.toLowerCase()));
+  const removed = new Set<string>();
+  const entries: Buffer[] = [];
+
+  let p = recordTableStart;
+  for (let i = 0; i < recordCount; i++) {
+    const entryStart = p;
+    const nameIndex = buf.readUInt32LE(p);
+    const typeLen = buf.readUInt32LE(p + 4);
+    const entryEnd = p + 8 + typeLen + 12 + 8;
+    p = entryEnd;
+    const record = strings[nameIndex];
+    if (record === undefined) throw new Error(`record ${i}: name index ${nameIndex} is outside the string table`);
+    if (drop.has(record.toLowerCase())) {
+      removed.add(record.toLowerCase());
+      continue;
+    }
+    entries.push(buf.subarray(entryStart, entryEnd));
+  }
+
+  const missing = [...drop].filter((n) => !removed.has(n));
+  if (missing.length) throw new Error(`not in this archive: ${missing.join(', ')}`);
+
+  const newTable = Buffer.concat(entries);
+  const header = Buffer.from(buf.subarray(0, 24));
+  header.writeUInt32LE(newTable.length, 8);
+  header.writeUInt32LE(entries.length, 12);
+  header.writeUInt32LE(recordTableStart + newTable.length, 16);
+  // The string-table size and the record-table start do not move.
+
+  return Buffer.concat([
+    header,
+    buf.subarray(24, recordTableStart), // every block, byte for byte, dead ones included
+    newTable,
+    buf.subarray(stringTableStart), // the string table and the sixteen trailing bytes
+  ]);
+}
+
 export interface ArzValueEdit {
   /** Record path, as the archive spells it (matched case-insensitively). */
   record: string;

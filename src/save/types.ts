@@ -274,7 +274,8 @@ export interface CharacterSave {
 
 /**
  * One hotbar position. `kind` is the game's own tag — `-1` empty, `0` a skill,
- * `2`/`3` the potion slots — and only kind 0 carries a payload.
+ * `2`/`3` the health/energy potion slots, and `4` a placed consumable. Skills
+ * and placed consumables carry their respective payloads.
  */
 export interface HotSlot {
   kind: number;
@@ -286,6 +287,14 @@ export interface HotSlot {
     item: string;
     /** Which equipment slot that item sits in. */
     equipSlot: number;
+  };
+  /** A consumable the player placed on the bar (kind 4). */
+  consumable?: {
+    record: string;
+    bitmapUp: string;
+    bitmapDown: string;
+    /** The colour-marked display name stored by the game, e.g. `{^r}Name`. */
+    name: string;
   };
 }
 

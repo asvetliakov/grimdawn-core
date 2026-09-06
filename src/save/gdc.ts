@@ -446,9 +446,10 @@ function readBlock16(r: GdReader, s: ParseState, block: BlockStart): void {
 /**
  * Block 14 — UI settings: the skill window, the five skill sets and the hotbar.
  *
- * A hot slot is a leading kind word — `-1` empty, `2`/`3` the potion slots, `0`
- * a skill — and only kind 0 carries a payload. Slots run until eight bytes
- * remain, which is the trailing word plus the camera distance.
+ * A hot slot is a leading kind word — `-1` empty, `2`/`3` the fixed potion
+ * slots, `0` a skill, and `4` a user-placed consumable. Kinds 0 and 4 carry
+ * different payloads. Slots run until eight bytes remain, which is the trailing
+ * word plus the camera distance.
  *
  * **The hotbar length is not a constant.** It read as 46 for as long as only two
  * characters were looked at, and 46 was written down as the expected count; a
@@ -476,6 +477,18 @@ function readBlock14(r: GdReader, s: ParseState, block: BlockStart): void {
   const hotSlots: HotSlot[] = [];
   while (block.bodyEnd - r.offset > 8) {
     const kind = r.readI32();
+    if (kind === 4) {
+      hotSlots.push({
+        kind,
+        consumable: {
+          record: r.readStr(),
+          bitmapUp: r.readStr(),
+          bitmapDown: r.readStr(),
+          name: r.readWStr(),
+        },
+      });
+      continue;
+    }
     if (kind !== 0) {
       hotSlots.push({ kind });
       continue;
@@ -527,6 +540,14 @@ export function encodeBlock14(save: CharacterSave, version: number): Seg[] {
   for (const word of ui.unknownWords) w.u32(word);
   for (const slot of ui.hotSlots) {
     w.i32(slot.kind);
+    if (slot.kind === 4) {
+      if (!slot.consumable) throw new Error('block 14: a consumable slot with no consumable');
+      w.str(slot.consumable.record);
+      w.str(slot.consumable.bitmapUp);
+      w.str(slot.consumable.bitmapDown);
+      w.wstr(slot.consumable.name);
+      continue;
+    }
     if (slot.kind !== 0) continue;
     if (!slot.skill) throw new Error('block 14: a skill slot with no skill');
     w.str(slot.skill.record);
